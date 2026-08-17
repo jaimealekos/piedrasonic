@@ -8,3 +8,7 @@ cache.json
 # Python
 __pycache__/
 *.pyc
+
+# PyInstaller
+build/
+dist/

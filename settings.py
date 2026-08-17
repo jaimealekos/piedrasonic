@@ -18,8 +18,17 @@ import customtkinter as ctk
 from theme import C, font
 from xtream import XtreamClient
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(APP_DIR, "config.json")
+# Rutas: cuando corre empaquetado (PyInstaller) los recursos van en _MEIPASS
+# (solo lectura) y los datos del usuario (config) junto al .exe (escribible).
+if getattr(sys, "frozen", False):
+    DATA_DIR = os.path.dirname(sys.executable)
+    RES_DIR = getattr(sys, "_MEIPASS", DATA_DIR)
+else:
+    DATA_DIR = os.path.dirname(os.path.abspath(__file__))
+    RES_DIR = DATA_DIR
+
+APP_DIR = DATA_DIR
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 DEFAULT_SERVER = "https://"      # prefijo genérico; el usuario introduce el suyo
 DEFAULT_UA = "VLC/3.0.20 LibVLC/3.0.20"
 

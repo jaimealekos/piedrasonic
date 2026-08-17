@@ -24,10 +24,12 @@ from player import VlcPlayer, VLC_OK
 import settings
 from settings import load_config, save_config
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(APP_DIR, "config.json")
+APP_DIR = settings.DATA_DIR                      # datos del usuario (escribible)
+RES_DIR = settings.RES_DIR                       # recursos (icono, estrellas)
+CONFIG_PATH = settings.CONFIG_PATH
 CACHE_PATH = os.path.join(APP_DIR, "cache.json")
-ICON = os.path.join(APP_DIR, "icon.ico")
+ICON = os.path.join(RES_DIR, "icon.ico")
+
 
 STAR_ON = "⭐"
 STAR_OFF = "☆"
@@ -60,8 +62,8 @@ class LiveApp(ctk.CTk):
         self.configure(fg_color=C["bg"])
         self._apply_icon()
         theme.style_tree(self)
-        self.img_on = tk.PhotoImage(file=os.path.join(APP_DIR, "star_on.png"))
-        self.img_off = tk.PhotoImage(file=os.path.join(APP_DIR, "star_off.png"))
+        self.img_on = tk.PhotoImage(file=os.path.join(RES_DIR, "star_on.png"))
+        self.img_off = tk.PhotoImage(file=os.path.join(RES_DIR, "star_off.png"))
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build()
         if settings.has_credentials(self.cfg):
