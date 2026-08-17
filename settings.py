@@ -20,7 +20,7 @@ from xtream import XtreamClient
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
-DEFAULT_SERVER = "https://max.veraneo.bid"
+DEFAULT_SERVER = "https://"      # prefijo genérico; el usuario introduce el suyo
 DEFAULT_UA = "VLC/3.0.20 LibVLC/3.0.20"
 
 
