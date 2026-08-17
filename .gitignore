@@ -1,0 +1,10 @@
+# Datos locales / privados (NO subir)
+config.json
+cache.json
+
+# Descargas parciales / temporales
+*.part
+
+# Python
+__pycache__/
+*.pyc
