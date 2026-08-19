@@ -8,6 +8,7 @@ configurables. Auto-reproduce el primer canal.
 Ejecutar:  pythonw iptv_player.pyw   (o run.bat)
 """
 import os
+import re
 import sys
 import json
 import threading
@@ -34,6 +35,24 @@ ICON = os.path.join(RES_DIR, "icon.ico")
 STAR_ON = "⭐"
 STAR_OFF = "☆"
 
+if sys.platform.startswith("win"):
+    import ctypes
+    from ctypes import wintypes
+
+    WM_SIZING = 0x0214
+    GWLP_WNDPROC = -4
+    WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, ctypes.c_uint,
+                                 ctypes.c_size_t, ctypes.c_ssize_t)
+    # WMSZ_*: qué borde se está arrastrando
+    SZ_IZQ = (1, 4, 7)                      # izquierda / sup-izq / inf-izq
+    SZ_ARR = (3, 4, 5)                      # arriba / sup-izq / sup-der
+    SZ_ALTO = (3, 6)                        # arriba o abajo: manda el alto
+
+
+CAT_MIN = 214           # ancho mínimo de la columna de categorías
+CH_MIN = 330            # ancho mínimo de la columna de canales
+MIN_W, MIN_H = 1040, 640                  # tamaño mínimo de la ventana
+
 
 class LiveApp(ctk.CTk):
     def __init__(self):
@@ -55,10 +74,21 @@ class LiveApp(ctk.CTk):
         self.cat_key = "all"
         self._first_load = True
         self._fs = False
+        self._panels_off = False      # modo solo-reproductor (atajo L)
+        self._panels_w = 0            # ancho que ocupaban las dos columnas
+        self._ontop = False           # ventana siempre encima (atajo A)
+        self._catchup_min = 0         # minutos por detrás del directo
+        self._minw = None             # ancho mínimo: no cabe menos sin franjas
+        self._shape_cache = None      # (columnas, aspecto) para el arrastre
+        self._oldproc = None             # WndProc original (se restaura al cerrar)
+        self._last_size = None           # para saber qué borde se arrastra
+        self._fit_use_h = False
+        self._fit_after = None
+        self._fit_both = False        # el cambio de formato ajusta en ambos sentidos
 
         self.title("piedrasonic")
         self.geometry(self.cfg.get("window_geometry") or "2335x975")
-        self.minsize(1040, 640)
+        self.minsize(MIN_W, MIN_H)
         self.configure(fg_color=C["bg"])
         self._apply_icon()
         theme.style_tree(self)
@@ -107,8 +137,8 @@ class LiveApp(ctk.CTk):
     def _build(self):
         body = ctk.CTkFrame(self, fg_color=C["bg"])
         body.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
-        body.columnconfigure(0, weight=0, minsize=214)
-        body.columnconfigure(1, weight=0, minsize=330)
+        body.columnconfigure(0, weight=0, minsize=CAT_MIN)
+        body.columnconfigure(1, weight=0, minsize=CH_MIN)
         body.columnconfigure(2, weight=1)
         body.rowconfigure(0, weight=1)
         self.body = body
@@ -197,13 +227,27 @@ class LiveApp(ctk.CTk):
         self.vid_col = vid_col
         self.player = VlcPlayer(vid_col, user_agent=self.cfg.get("user_agent", "VLC/3.0"),
                                 network_caching=int(self.cfg.get("network_caching", 1500)),
-                                request_fullscreen=self.toggle_fullscreen)
+                                request_fullscreen=self.toggle_fullscreen,
+                                request_panels=self.toggle_panels,
+                                on_aspect=self._on_aspect,
+                                request_ontop=self.toggle_ontop,
+                                volume=int(self.cfg.get("volume", 90) or 90),
+                                muted=bool(self.cfg.get("muted", False)))
         self.player.grid(row=0, column=0, sticky="nsew")
         self._build_catchup()
 
         self.bind("<F11>", lambda e: self.toggle_fullscreen())
         self.bind("<Escape>", lambda e: self.toggle_fullscreen(False))
         self.bind("<F5>", lambda e: self.load(force=True))
+        body.bind("<Configure>", self._fit_video, add="+")
+        self.after(200, self._fit_video)
+        self.after(300, self._hook_resize)
+        atajos = (("l", self._key_panels), ("m", self._key_mute),
+                  ("a", self._key_ontop), ("s", self._key_snap))
+        for letra, fn in atajos:
+            for k in (letra, letra.upper()):
+                for w in (self, self.player.top, self.player.bottom):
+                    w.bind(f"<KeyPress-{k}>", fn)
 
     def _build_catchup(self):
         a = self.player.actions
@@ -216,6 +260,24 @@ class LiveApp(ctk.CTk):
                           text_color=C["text"], font=font(11),
                           command=lambda m=mins: self.play_catchup(m)).pack(
                               side=tk.LEFT, padx=3)
+        self.catchup_var = tk.StringVar(value="45")
+        ent = ctk.CTkEntry(a, textvariable=self.catchup_var, width=48, height=28,
+                           corner_radius=8, fg_color=C["surface2"], border_width=0,
+                           justify="center", font=font(11))
+        ent.pack(side=tk.LEFT, padx=(12, 2))
+        ent.bind("<Return>", lambda e: self.catchup_step(True))
+        ctk.CTkLabel(a, text="min", text_color=C["muted"],
+                     font=font(10)).pack(side=tk.LEFT, padx=(0, 4))
+        ctk.CTkButton(a, text="◀", width=30, height=28, corner_radius=8,
+                      fg_color=C["surface2"], hover_color=C["surface3"],
+                      text_color=C["text"], font=font(11),
+                      command=lambda: self.catchup_step(True)).pack(
+                          side=tk.LEFT, padx=(0, 2))
+        ctk.CTkButton(a, text="▶", width=30, height=28, corner_radius=8,
+                      fg_color=C["surface2"], hover_color=C["surface3"],
+                      text_color=C["text"], font=font(11),
+                      command=lambda: self.catchup_step(False)).pack(
+                          side=tk.LEFT, padx=(0, 2))
         ctk.CTkButton(a, text="● Directo", width=84, height=28, corner_radius=8,
                       fg_color=C["accent"], hover_color=C["accent_hi"],
                       text_color="#ffffff", font=font(11, "bold"),
@@ -685,30 +747,306 @@ class LiveApp(ctk.CTk):
                       command=save).pack(fill=tk.X, padx=14, pady=12)
 
     # ------------------------------------------------------------------
+    def _side_panels(self, show):
+        """Muestra u oculta las dos columnas de la izquierda."""
+        if show:
+            self.body.columnconfigure(0, minsize=CAT_MIN)
+            self.body.columnconfigure(1, minsize=CH_MIN)
+            self.cat_col.grid()
+            self.ch_col.grid()
+            self._fit_video()
+        else:
+            self.cat_col.grid_remove()
+            self.ch_col.grid_remove()
+            self.body.columnconfigure(0, minsize=0)
+            self.body.columnconfigure(1, minsize=0)
+
     def toggle_fullscreen(self, want=None):
         target = (not self._fs) if want is None else bool(want)
         if target == self._fs:
             return
         self._fs = target
         if target:
-            self.cat_col.grid_remove()
-            self.ch_col.grid_remove()
-            self.body.columnconfigure(0, minsize=0)
-            self.body.columnconfigure(1, minsize=0)
+            self._side_panels(False)
             self.attributes("-fullscreen", True)
         else:
             self.attributes("-fullscreen", False)
-            self.body.columnconfigure(0, minsize=214)
-            self.body.columnconfigure(1, minsize=330)
-            self.cat_col.grid()
-            self.ch_col.grid()
+            if not self._panels_off:          # respeta el modo solo-reproductor
+                self._side_panels(True)
         self.player.set_fullscreen(target)
+
+    def _cols_width(self):
+        """Ancho real (fijo) de las dos columnas con sus márgenes de rejilla.
+        Se mide sobre las propias columnas: al contrario que cuerpo−vídeo, no
+        se descoloca en los reflows intermedios de un cambio de geometría."""
+        try:
+            a = self.cat_col.winfo_width()
+            b = self.ch_col.winfo_width()
+            if a > 10 and b > 10:
+                return a + b + 30        # padx de la rejilla: (14+6)+(0+10)
+        except Exception:
+            pass
+        return CAT_MIN + CH_MIN + 30
+
+    def _fit_video(self, _e=None):
+        """Las columnas tienen ANCHO FIJO y el vídeo ocupa el resto. Aquí solo
+        se vigila que no queden franjas arriba y abajo: si el vídeo se queda
+        corto de ancho se acomoda la VENTANA (diferido), nunca las columnas.
+        El aire a los lados (maximizada, canal 4:3…) se deja en paz."""
+        if self._fs or self._panels_off:
+            return
+        try:
+            bw, bh = self.body.winfo_width(), self.body.winfo_height()
+            if bw < 200 or bh < 200:
+                return
+            cols = self._cols_width()
+            self._shape_cache = (cols, self.player.aspect())
+            self._apply_minsize(cols)
+            prev, self._last_size = self._last_size, (bw, bh)
+            aire = int(round(bh * self.player.aspect())) - (bw - cols)
+            if aire > 2:                             # franjas arriba/abajo
+                self._fit_use_h = bool(prev) and prev[0] != bw
+                self._schedule_window_fit()
+        except Exception:
+            pass
+
+    def _shape(self, w=None, h=None):
+        """Forma válida del área de cliente: columnas fijas + vídeo sin franjas."""
+        cols, ar = self._shape_cache or (CAT_MIN + CH_MIN + 30, 16 / 9)
+        if w is not None:
+            return int(w), max(MIN_H, int(round((w - cols) / ar)))
+        return int(round(cols + h * ar)), int(h)
+
+    def _apply_minsize(self, cols=None):
+        """Ancho mínimo de la ventana: por debajo no cabe el vídeo sin franjas
+        ni con el alto al mínimo, así que el arrastre se detiene ahí."""
+        try:
+            if cols is None:
+                cols = self._cols_width()
+            g = self._geom_parts()
+            rw = self.winfo_width()
+            escala = (rw / g[0]) if (g and g[0] and rw) else 1.0
+            w = int(round((cols + MIN_H * self.player.aspect()) / escala)) + 2
+            w = max(MIN_W, min(w, int(self.winfo_screenwidth() / escala)))
+            if w != self._minw:
+                self._minw = w
+                self.minsize(w, MIN_H)
+        except Exception:
+            pass
+
+    def _on_aspect(self):
+        """Ha cambiado el formato del canal: la ventana se acomoda en ambos
+        sentidos (se ensancha para el cine, vuelve al acabar); las columnas
+        no se mueven."""
+        self._fit_use_h = False
+        self._fit_both = True
+        self._fit_video()
+        self._schedule_window_fit()
+
+    def _schedule_window_fit(self):
+        # diferido: así no se pelea con el arrastre del borde de la ventana
+        if self._fit_after:
+            try:
+                self.after_cancel(self._fit_after)
+            except Exception:
+                pass
+        self._fit_after = self.after(180, self._fit_window)
+
+    def _fit_window(self):
+        """Deja la ventana en una forma válida tocando el eje que NO se está
+        arrastrando (al arrancar o al cambiar de formato, el ancho)."""
+        self._fit_after = None
+        both, self._fit_both = self._fit_both, False
+        if self._fs or self._panels_off or self.state() != "normal":
+            return
+        try:
+            g = self._geom_parts()
+            rw, rh = self.winfo_width(), self.winfo_height()
+            if not g or not g[0] or rw < 200 or rh < 200:
+                return
+            cols, ar = self._shape_cache or (CAT_MIN + CH_MIN + 30, 16 / 9)
+            aire = int(round(rh * ar)) - (rw - cols)
+            if not both and aire <= 2:
+                return              # el estado que lo programó ya no existe
+            gw, gh, x, y = g
+            escala = rw / g[0]
+            ancho = self._shape(h=rh)[0]         # ancho que pide el alto actual
+            alto = self._shape(w=rw)[1]          # alto que pide el ancho actual
+            new_gw = int(round(ancho / escala))
+            new_gh = int(round(alto / escala))
+            ancho_ok = ancho <= self.winfo_screenwidth() and new_gw >= MIN_W
+            alto_ok = new_gh >= MIN_H
+            if self._fit_use_h and alto_ok:
+                gh = new_gh
+            elif ancho_ok:
+                gw = new_gw
+            elif alto_ok:
+                gh = new_gh
+            else:
+                return                           # no cabe: se deja estar
+            if abs(gw - g[0]) <= 2 and abs(gh - g[1]) <= 2:
+                return
+            sw = int(self.winfo_screenwidth() / escala)
+            self.geometry(f"{gw}x{gh}+{max(0, min(x, sw - gw))}+{y}")
+        except Exception:
+            pass
+
+    # ---- límite del arrastre EN VIVO (Windows) ------------------------
+    def _hook_resize(self):
+        """Intercepta WM_SIZING para limitar el arrastre mientras ocurre: el
+        borde solo se mueve a formas válidas, así que se ve en tiempo real cómo
+        queda en vez de arrastrar libremente y corregir al soltar."""
+        if not sys.platform.startswith("win"):
+            return
+        try:
+            u = ctypes.windll.user32
+            u.CallWindowProcW.restype = ctypes.c_ssize_t
+            u.CallWindowProcW.argtypes = [ctypes.c_void_p, wintypes.HWND,
+                                          ctypes.c_uint, ctypes.c_size_t,
+                                          ctypes.c_ssize_t]
+            u.GetAncestor.restype = ctypes.c_void_p
+            self._hwnd = ctypes.c_void_p(u.GetAncestor(self.winfo_id(), 2))  # GA_ROOT
+            setter = getattr(u, "SetWindowLongPtrW", u.SetWindowLongW)
+            setter.restype = ctypes.c_void_p
+            setter.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+            self._proc = WNDPROC(self._wndproc)     # referencia viva: no tocar
+            self._setter = setter
+            self._oldproc = setter(self._hwnd, GWLP_WNDPROC,
+                                   ctypes.cast(self._proc, ctypes.c_void_p))
+        except Exception:
+            self._oldproc = None
+
+    def _unhook_resize(self):
+        try:
+            if self._oldproc:
+                self._setter(self._hwnd, GWLP_WNDPROC, self._oldproc)
+                self._oldproc = None
+        except Exception:
+            pass
+
+    def _wndproc(self, hwnd, msg, wparam, lparam):
+        if msg == WM_SIZING and not (self._fs or self._panels_off):
+            try:
+                self._limit_drag(int(wparam), lparam)
+            except Exception:
+                pass
+        return ctypes.windll.user32.CallWindowProcW(self._oldproc, hwnd, msg,
+                                                    wparam, lparam)
+
+    def _limit_drag(self, borde, lparam):
+        """Recorta el rectángulo que propone el arrastre a la forma válida."""
+        u = ctypes.windll.user32
+        r = ctypes.cast(ctypes.c_void_p(lparam),
+                        ctypes.POINTER(wintypes.RECT)).contents
+        marco = wintypes.RECT(); cliente = wintypes.RECT()
+        u.GetWindowRect(self._hwnd, ctypes.byref(marco))
+        u.GetClientRect(self._hwnd, ctypes.byref(cliente))
+        dw = (marco.right - marco.left) - (cliente.right - cliente.left)
+        dh = (marco.bottom - marco.top) - (cliente.bottom - cliente.top)
+        cw, ch = (r.right - r.left) - dw, (r.bottom - r.top) - dh
+        if borde in SZ_ALTO:                 # arrastra arriba/abajo: manda el alto
+            cw, ch = self._shape(h=ch)
+        else:                                # laterales y esquinas: manda el ancho
+            cw, ch = self._shape(w=cw)
+        w, h = cw + dw, ch + dh
+        if borde in SZ_IZQ:
+            r.left = r.right - w
+        else:
+            r.right = r.left + w
+        if borde in SZ_ARR:
+            r.top = r.bottom - h
+        else:
+            r.bottom = r.top + h
+
+    # ---- modo solo-reproductor (botón de la barra / tecla L) ----------
+    def _geom_parts(self):
+        """(ancho, alto, x, y) de la ventana, o None si no se puede leer."""
+        m = re.match(r"^(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$", self.geometry())
+        return tuple(int(v) for v in m.groups()) if m else None
+
+    def _panels_width(self, g):
+        """Ancho de las dos columnas, en las unidades que usa geometry().
+        CustomTkinter escala la geometría con los DPI del monitor mientras que
+        winfo_* da píxeles reales; el factor se mide comparando ambos."""
+        real = self.winfo_width()
+        if real <= 0 or not g[0]:
+            return 0
+        scale = real / g[0]
+        return max(int(round((real - self.vid_col.winfo_width()) / scale)), 0)
+
+    def _restored_geometry(self):
+        """Geometría equivalente con las dos columnas visibles."""
+        g = self._geom_parts()
+        if not (self._panels_w and g):
+            return self.geometry()
+        w, h, x, y = g
+        return f"{w + self._panels_w}x{h}+{max(x - self._panels_w, 0)}+{y}"
+
+    def toggle_panels(self, want=None):
+        """Oculta las dos columnas de la izquierda y encoge la ventana justo lo
+        que ocupaban, de modo que el vídeo no cambia ni de tamaño ni de sitio.
+        Al volver a pulsar se recupera todo. Atajo: L."""
+        if self._fs:                      # en pantalla completa ya están fuera
+            return
+        target = (not self._panels_off) if want is None else bool(want)
+        if target == self._panels_off:
+            return
+        self._panels_off = target
+        self.update_idletasks()           # geometría ya asentada antes de medir
+        if target:
+            g = self._geom_parts() if self.state() == "normal" else None
+            self._panels_w = self._panels_width(g) if g else 0
+            self._side_panels(False)
+            if self._panels_w:
+                self.minsize(480, 400)    # el vídeo solo puede ser más estrecho
+                self._minw = None
+                w, h, x, y = g
+                self.geometry(f"{w - self._panels_w}x{h}+{x + self._panels_w}+{y}")
+        else:
+            geo = self._restored_geometry() if self.state() == "normal" else None
+            self._side_panels(True)
+            if self._panels_w:
+                self._apply_minsize()
+                if geo:
+                    self.geometry(geo)
+            self._panels_w = 0
+        self.player.set_panels_hidden(target)
+
+    def _typing(self, e):
+        # para no robar la tecla mientras se escribe (buscador, diálogos…)
+        return isinstance(getattr(e, "widget", None), (tk.Entry, ttk.Entry, tk.Text))
+
+    def _key_panels(self, e):
+        if not self._typing(e):
+            self.toggle_panels()
+
+    def _key_mute(self, e):
+        if not self._typing(e):
+            self.player.toggle_mute()
+
+    def _key_ontop(self, e):
+        if not self._typing(e):
+            self.toggle_ontop()
+
+    def _key_snap(self, e):
+        if not self._typing(e):
+            self.player.snapshot()
+
+    def toggle_ontop(self, want=None):
+        """Fija la ventana por encima de todas (botón 📌 / tecla A)."""
+        self._ontop = (not self._ontop) if want is None else bool(want)
+        try:
+            self.attributes("-topmost", self._ontop)
+        except Exception:
+            pass
+        self.player.set_ontop(self._ontop)
 
     def play_current(self):
         s = self._selected() or self.current_stream
         if not s:
             return
         self.current_stream = s
+        self._catchup_min = 0
         self.player.play(self.client.live_url(s["stream_id"]),
                          title=s.get("name", ""), live=True)
 
@@ -716,10 +1054,31 @@ class LiveApp(ctk.CTk):
         s = self.current_stream or self._selected()
         if not s:
             return
+        minutes_back = int(minutes_back)
+        self._catchup_min = minutes_back
         start_dt = datetime.now() - timedelta(minutes=minutes_back)
         start = start_dt.strftime("%Y-%m-%d:%H-%M")
         url = self.client.timeshift_url(s["stream_id"], start, minutes_back + 240)
-        self.player.play(url, title=f"{s.get('name','')} · catch-up", live=False)
+        eti = (f"-{minutes_back // 60}h"
+               if minutes_back % 60 == 0 and minutes_back >= 60
+               else f"-{minutes_back}m")
+        self.player.play(url, title=f"{s.get('name','')} · catch-up {eti}",
+                         live=False)
+
+    def catchup_step(self, back):
+        """Salta los minutos de la caja: ◀ hacia atrás, ▶ hacia delante,
+        siempre desde el punto actual; llegar a 0 devuelve al directo."""
+        try:
+            x = int(float(self.catchup_var.get().strip().replace(",", ".")))
+        except (ValueError, AttributeError):
+            return
+        if x <= 0:
+            return
+        m = self._catchup_min + (x if back else -x)
+        if m <= 0:
+            self.play_current()
+        else:
+            self.play_catchup(min(m, 10080))         # tope: 7 días
 
     def export_m3u(self):
         if not self.all_streams:
@@ -736,10 +1095,13 @@ class LiveApp(ctk.CTk):
             self.client.build_m3u(streams, self.cat_name))
 
     def _on_close(self):
+        self._unhook_resize()
         try:
             if not self._fs and self.state() == "normal":
-                self.cfg["window_geometry"] = self.geometry()
-                save_config(self.cfg)
+                self.cfg["window_geometry"] = self._restored_geometry()
+            v, m = self.player.get_volume_state()
+            self.cfg["volume"], self.cfg["muted"] = int(v), bool(m)
+            save_config(self.cfg)
         except Exception:
             pass
         try:

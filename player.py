@@ -1,20 +1,28 @@
 """
 Reproductor VLC embebido con controles en capas flotantes TRANSLÚCIDAS.
 El vídeo ocupa toda la superficie; las barras de control son ventanas sin
-borde con canal alfa (transparencia real, -topmost) posicionadas sobre el
-vídeo. Se muestran/ocultan con un clic y se esconden cuando la app pierde el
-foco (para no flotar sobre otras aplicaciones).
+borde con canal alfa, PROPIEDAD (owner) de la ventana principal y SIN
+-topmost: al ser propiedad del root van siempre por encima de él (y del
+vídeo nativo de VLC), pero por debajo de cualquier otra aplicación que nos
+tape, así que Windows las recorta solo — nada de regiones ni sondeos de
+foco. Minimizar el root las esconde también solo (regla de owned windows).
 
 Claves de Windows/Tk aprendidas:
-  * -topmost y -alpha se fijan AL CREAR la ventana; re-fijar -topmost luego
-    resetea su geometría.
+  * -alpha se fija AL CREAR la ventana.
   * Se oculta moviéndola fuera de pantalla (withdraw/deiconify no re-mapea
     ventanas overrideredirect de forma fiable).
-  * Las ventanas -topmost SÍ se dibujan sobre el vídeo nativo de VLC.
+  * El dueño se fija con GWLP_HWNDPARENT; una ventana owned se dibuja sobre
+    su dueño sin necesidad de -topmost (también sobre el hijo de VLC).
+  * SetWindowRgn sobre ventanas con -alpha (layered) es terreno minado: se
+    probó para recortar las barras y provocaba cuelgues y redibujos rotos.
 
 Requiere: python-vlc + VLC instalado (libvlc.dll).
 """
+import os
+import re
 import sys
+import time
+from datetime import datetime
 import tkinter as tk
 import customtkinter as ctk
 from theme import C, font
@@ -27,7 +35,52 @@ except Exception as e:                # pragma: no cover
     VLC_OK = False
     VLC_ERR = e
 
+if sys.platform.startswith("win"):
+    import ctypes
+
+    _GA_ROOT = 2
+    _GWLP_HWNDPARENT = -8
+    _U = ctypes.windll.user32          # objeto cacheado: firmas, una sola vez
+    _U.GetAncestor.restype = ctypes.c_void_p
+    _U.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    _SETPTR = getattr(_U, "SetWindowLongPtrW", _U.SetWindowLongW)
+    _SETPTR.restype = ctypes.c_void_p
+    _SETPTR.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+
+    class _POINT(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+    _U.WindowFromPoint.restype = ctypes.c_void_p
+    _U.WindowFromPoint.argtypes = [_POINT]
+
+
+def _desktop_dir():
+    """Carpeta real del Escritorio (aguanta OneDrive y Windows en español)."""
+    home = os.path.expanduser("~")
+    if sys.platform.startswith("win"):
+        try:
+            class _GUID(ctypes.Structure):
+                _fields_ = [("a", ctypes.c_ulong), ("b", ctypes.c_ushort),
+                            ("c", ctypes.c_ushort), ("d", ctypes.c_ubyte * 8)]
+            fid = _GUID(0xB4BFCC3A, 0xDB2C, 0x424C,      # FOLDERID_Desktop
+                        (ctypes.c_ubyte * 8)(0xB0, 0x29, 0x7F, 0xE9,
+                                             0x9A, 0x87, 0xC6, 0x41))
+            p = ctypes.c_wchar_p()
+            if ctypes.windll.shell32.SHGetKnownFolderPath(
+                    ctypes.byref(fid), 0, None, ctypes.byref(p)) == 0:
+                d = p.value
+                ctypes.windll.ole32.CoTaskMemFree(p)
+                if d and os.path.isdir(d):
+                    return d
+        except Exception:
+            pass
+    d = os.path.join(home, "Desktop")
+    return d if os.path.isdir(d) else home
+
+
 OVL = "#0d0d10"
+ASPECT_MIN = 16 / 9                # nunca más estrecho que 16:9
+ASPECT_MAX = 3.0
 ALPHA = 0.78
 OFFSCREEN = "1x1+-10000+-10000"
 
@@ -49,12 +102,13 @@ def _icon(master, glyph, cmd, size=34, fsize=15):
 
 
 class _Bar(tk.Toplevel):
-    """Ventana translúcida sin borde, siempre por encima, usada como capa."""
+    """Ventana translúcida sin borde usada como capa sobre el vídeo. No es
+    -topmost: se le pone como dueño el root (ver _own_bars), con lo que va
+    encima de él pero debajo de las demás aplicaciones."""
     def __init__(self, master):
         super().__init__(master)
         self.overrideredirect(True)
         try:
-            self.attributes("-topmost", True)   # AL CREAR (no re-fijar luego)
             self.attributes("-alpha", ALPHA)
         except Exception:
             pass
@@ -72,16 +126,28 @@ class _Bar(tk.Toplevel):
 
 class VlcPlayer(ctk.CTkFrame):
     def __init__(self, master, user_agent="VLC/3.0", network_caching=1500,
-                 request_fullscreen=None):
+                 request_fullscreen=None, request_panels=None, on_aspect=None,
+                 request_ontop=None, snapshot_dir=None, volume=90, muted=False):
         super().__init__(master, fg_color=C["video"], corner_radius=0)
         self.user_agent = user_agent
         self.network_caching = network_caching
         self.request_fullscreen = request_fullscreen
+        self.request_panels = request_panels
+        self.on_aspect = on_aspect
+        self.request_ontop = request_ontop
+        self.snapshot_dir = snapshot_dir
         self._seeking = False
         self._live = True
         self._overlay_on = True
         self._actions_on = False
-        self._active = True
+        self._focus_ts = 0.0           # última vez que la app ganó el foco
+        self._pointer_in = False       # puntero sobre el vídeo o las barras
+        self._leave_after = None
+        self._resize_ts = 0.0          # último Configure (arrastre del borde)
+        self._resize_after = None
+        self._muted = False
+        self._vol_prev = int(volume) if int(volume) > 0 else 90
+        self._ar = ASPECT_MIN
         self._cfg_after = None
         self._idle_pending = False
         self._fs_mode = False
@@ -105,6 +171,8 @@ class VlcPlayer(ctk.CTkFrame):
         self.video.bind("<Button-1>", lambda e: self._on_video_click())
         self.video.bind("<Double-1>", lambda e: self._fs_click())
         self.video.bind("<Motion>", self._on_motion)
+        self.video.bind("<Enter>", self._on_enter)
+        self.video.bind("<Leave>", self._on_leave)
 
         # ---------- capas ----------
         self.top = _Bar(self)
@@ -141,27 +209,38 @@ class VlcPlayer(ctk.CTkFrame):
         self.live_badge = ctk.CTkLabel(self.bar, text="● DIRECTO",
                                        text_color=C["danger"], font=font(11, "bold"))
         self.live_badge.pack(side=tk.LEFT, padx=(4, 10))
-        ctk.CTkLabel(self.bar, text="🔊", text_color=C["text"],
-                     font=font(13)).pack(side=tk.LEFT, padx=(2, 2))
+        self.btn_mute = _icon(self.bar, "🔊", self.toggle_mute, 30, 13)
+        self.btn_mute.pack(side=tk.LEFT, padx=(2, 2), pady=8)
         self.vol = ctk.CTkSlider(self.bar, from_=0, to=100, width=90, height=16,
                                  button_color=C["text"], button_hover_color="#ffffff",
                                  progress_color=C["muted"], fg_color=C["surface3"],
                                  command=self._on_vol)
-        self.vol.set(90)
+        self.vol.set(self._vol_prev)
         self.vol.pack(side=tk.LEFT, padx=(0, 6))
+        if muted:
+            self.toggle_mute(True)
+        self.btn_snap = _icon(self.bar, "📷", self.snapshot, 34, 13)
+        self.btn_snap.pack(side=tk.LEFT, padx=(4, 0), pady=8)
+        self.btn_ontop = _icon(self.bar, "📌", self._ontop_click, 34, 13)
+        self.btn_ontop.pack(side=tk.LEFT, padx=(4, 0), pady=8)
+        self.btn_panels = _icon(self.bar, "◧", self._panels_click, 34, 17)
+        self.btn_panels.pack(side=tk.LEFT, padx=(4, 0), pady=8)
         _icon(self.bar, "⛶", self._fs_click, 34, 14).pack(side=tk.LEFT, padx=(4, 14), pady=8)
 
         self._bind_hwnd()
         self._rootwin = self.winfo_toplevel()
+        self._own_bars()
         # reposicionar SÍNCRONO en cada resize/move (root y vídeo) para que las
         # capas no se queden descolgadas al arrastrar el borde de la ventana
         self._rootwin.bind("<Configure>", self._reposition, add="+")
         self.video.bind("<Configure>", self._reposition, add="+")
         self._rootwin.bind("<FocusIn>", self._on_focus_in, add="+")
-        self._rootwin.bind("<FocusOut>", self._on_focus_out, add="+")
         # movimiento del ratón sobre vídeo o barras -> revela en pantalla completa
         for w in (self.top, self.top.inner, self.bottom, self.bottom.inner):
             w.bind("<Motion>", self._on_motion, add="+")
+        for w in (self.top, self.bottom):
+            w.bind("<Enter>", self._on_enter, add="+")
+            w.bind("<Leave>", self._on_leave, add="+")
         self.after(120, self._refresh)
         self.after(500, self._tick)
         if not VLC_OK:
@@ -217,14 +296,9 @@ class VlcPlayer(ctk.CTkFrame):
         return True
 
     def _want(self):
-        if not self._overlay_on or not self._active:
+        if not self._want_base():
             return False
-        if self._fs_mode and not self._revealed:
-            return False
-        try:
-            return self._rootwin.state() not in ("iconic", "withdrawn")
-        except Exception:
-            return True
+        return not (self._fs_mode and not self._revealed)
 
     def _refresh(self):
         if self._want() and self._place():
@@ -234,6 +308,15 @@ class VlcPlayer(ctk.CTkFrame):
             self.bottom.hide_off()
 
     def _reposition(self, _e=None):
+        # mientras dura el arrastre del borde las barras se quedan puestas; al
+        # acabar se vuelve a mirar si el ratón sigue encima
+        self._resize_ts = time.time()
+        if self._resize_after:
+            try:
+                self.after_cancel(self._resize_after)
+            except Exception:
+                pass
+        self._resize_after = self.after(900, self._resize_done)
         # inmediato (sigue el arrastre) + pasada after_idle (fija la posición
         # final exacta cuando el layout se ha asentado) => sin lag residual
         if self._want() and self._place():
@@ -249,34 +332,43 @@ class VlcPlayer(ctk.CTkFrame):
         if self._want():
             self._place()
 
+    def _resize_done(self):
+        # al expirar el margen hay que RE-EVALUAR sí o sí: aunque el ratón no
+        # haya cambiado de sitio, la excusa de "se está redimensionando" acaba
+        # de caducar y con ella la razón por la que estaban puestas
+        self._resize_after = None
+        self._pointer_in = self._pointer_over()
+        self._refresh()
+
     def _on_focus_in(self, _e):
-        self._active = True
+        # marca de tiempo: el clic que ACTIVA la ventana no debe además
+        # alternar los controles (ver _on_video_click)
+        self._focus_ts = time.time()
         self._refresh()
 
-    def _on_focus_out(self, _e):
-        self.after(120, self._check_active)
+    @staticmethod
+    def _hwnd(w):
+        """HWND de la ventana de nivel superior que contiene al widget."""
+        return _U.GetAncestor(w.winfo_id(), _GA_ROOT)
 
-    def _check_active(self):
-        self._active = self._is_foreground()
-        self._refresh()
-
-    def _is_foreground(self):
-        """True si NUESTRA ventana principal es la activa del sistema.
-        Evita que las barras -topmost floten sobre otras apps o sobre
-        nuestros propios diálogos."""
+    def _own_bars(self):
+        """Hace a las barras PROPIEDAD del root (GWLP_HWNDPARENT): quedan por
+        encima de él y del vídeo sin -topmost, y por debajo de las demás
+        aplicaciones, que las recortan/tapan de forma natural."""
         if not sys.platform.startswith("win"):
             try:
-                return self.focus_get() is not None
+                for w in (self.top, self.bottom):
+                    w.wm_transient(self._rootwin)
             except Exception:
-                return True
+                pass
+            return
         try:
-            import ctypes
-            u = ctypes.windll.user32
-            fg = u.GetForegroundWindow()
-            root_hwnd = u.GetAncestor(self._rootwin.winfo_id(), 2)  # GA_ROOT
-            return int(fg) == int(root_hwnd)
+            root_h = self._hwnd(self._rootwin)
+            for w in (self.top, self.bottom):
+                _SETPTR(self._hwnd(w), _GWLP_HWNDPARENT, root_h)
+                w.lift()
         except Exception:
-            return True
+            pass
 
     # ---- pantalla completa: auto-ocultar y revelar al mover el ratón ---
     def set_fullscreen(self, on):
@@ -298,21 +390,87 @@ class VlcPlayer(ctk.CTkFrame):
     def _on_video_click(self):
         if self._fs_mode:
             self._reveal()
-        else:
+        elif time.time() - self._focus_ts > 0.35:
+            # el clic que trae la ventana al frente no alterna los controles
             self.toggle_overlay()
 
     def _on_motion(self, _e=None):
+        if not self._pointer_in:
+            self._on_enter()
         if self._fs_mode and self._want_base():
             self._reveal()
 
+    def _on_enter(self, _e=None):
+        self._leave_cancel()
+        if not self._pointer_in:
+            self._pointer_in = True
+            self._refresh()
+
+    def _on_leave(self, _e=None):
+        # con margen: al cruzar del vídeo a la barra hay un Leave transitorio
+        self._leave_cancel()
+        self._leave_after = self.after(250, self._leave_check)
+
+    def _leave_cancel(self):
+        if self._leave_after:
+            try:
+                self.after_cancel(self._leave_after)
+            except Exception:
+                pass
+            self._leave_after = None
+
+    def _leave_check(self):
+        self._leave_after = None
+        dentro = self._pointer_over()
+        if dentro != self._pointer_in:
+            self._pointer_in = dentro
+            self._refresh()
+
+    def _pointer_over(self):
+        """True si el puntero está de verdad sobre NUESTRO vídeo o barras (si
+        otra ventana tapa ese punto, el punto es suyo y devuelve False)."""
+        try:
+            px, py = self.winfo_pointerxy()
+        except Exception:
+            return False
+        if not sys.platform.startswith("win"):
+            try:
+                x, y = self.video.winfo_rootx(), self.video.winfo_rooty()
+                return (x <= px < x + self.video.winfo_width()
+                        and y <= py < y + self.video.winfo_height())
+            except Exception:
+                return False
+        try:
+            under = _U.WindowFromPoint(_POINT(int(px), int(py)))
+            if not under:
+                return False
+            mine = {self._hwnd(w) for w in (self._rootwin, self.top, self.bottom)}
+            return _U.GetAncestor(under, _GA_ROOT) in mine
+        except Exception:
+            return False
+
     def _want_base(self):
-        # como _want pero ignorando el estado de revelado (para poder revelar)
-        if not self._overlay_on or not self._active:
+        """ÚNICO sitio donde se decide si debe haber barras (ignorando el
+        auto-ocultado de pantalla completa, que va en _want):
+
+          * los controles alternados con un clic mandan sobre todo lo demás;
+          * en ventana solo se ven con el ratón encima del reproductor...
+          * ...salvo mientras se redimensiona o se mueve la ventana: ahí el
+            puntero está en el borde, fuera del vídeo, y ocultarlos sería
+            justo lo contrario de lo que uno quiere ver al ajustar el tamaño;
+          * minimizada, nunca.
+        """
+        if not self._overlay_on:
+            return False
+        if not self._fs_mode and not self._pointer_in and not self._resizing():
             return False
         try:
             return self._rootwin.state() not in ("iconic", "withdrawn")
         except Exception:
             return True
+
+    def _resizing(self):
+        return (time.time() - self._resize_ts) < 0.8
 
     def _reveal(self):
         if self._hide_after:
@@ -414,8 +572,30 @@ class VlcPlayer(ctk.CTkFrame):
         self.placeholder.place(relx=0.5, rely=0.5, anchor="center")
 
     def _on_vol(self, _v):
+        v = int(float(self.vol.get()))
+        if v:
+            self._vol_prev = v
+        self._set_muted(v == 0)
+        self._apply_vol()
+
+    def toggle_mute(self, on=None):
+        target = (not self._muted) if on is None else bool(on)
+        self.vol.set(0 if target else (self._vol_prev or 50))
+        self._set_muted(target)
+        self._apply_vol()
+
+    def _set_muted(self, on):
+        self._muted = bool(on)
+        self.btn_mute.configure(text="🔇" if self._muted else "🔊")
+
+    def _apply_vol(self):
         if VLC_OK:
             self.mp.audio_set_volume(int(float(self.vol.get())))
+
+    def get_volume_state(self):
+        """(nivel, silenciado) para recordarlo entre sesiones."""
+        nivel = self._vol_prev if self._muted else int(float(self.vol.get()))
+        return nivel, self._muted
 
     def _on_seek_move(self, _v):
         if self._seeking:
@@ -434,13 +614,71 @@ class VlcPlayer(ctk.CTkFrame):
         if callable(self.request_fullscreen):
             self.request_fullscreen()
 
-    def _tick(self):
-        # sondeo de ventana activa: oculta las barras si la app no está al frente
+    def aspect(self):
+        """Proporción (ancho/alto) que debe tener la superficie para que el
+        vídeo no salga con franjas arriba y abajo. Nunca baja de 16:9: si el
+        canal es más estrecho (4:3, SD anamórfico) las franjas caen a los
+        lados, que es justo lo que se busca."""
+        return self._ar
+
+    def _read_aspect(self):
+        """Proporción del vídeo en curso, o None si todavía no se sabe."""
+        if not VLC_OK or self.mp is None:
+            return None
         try:
-            act = self._is_foreground()
-            if act != self._active:
-                self._active = act
-                self._refresh()
+            w, h = self.mp.video_get_size(0)      # (0, 0) hasta que arranca
+        except Exception:
+            return None
+        if not (w and h):
+            return None
+        return min(max(w / float(h), ASPECT_MIN), ASPECT_MAX)
+
+    def _panels_click(self):
+        if callable(self.request_panels):
+            self.request_panels()
+
+    def _ontop_click(self):
+        if callable(self.request_ontop):
+            self.request_ontop()
+
+    def set_ontop(self, on):
+        """El root cambia de banda (-topmost): las barras tienen que ir CON él,
+        o quedarían por debajo del propio root y desaparecerían."""
+        self.btn_ontop.configure(text_color=C["accent"] if on else C["text"])
+        for w in (self.top, self.bottom):
+            try:
+                w.attributes("-topmost", bool(on))
+                w.lift()
+            except Exception:
+                pass
+        self._refresh()               # re-fijar -topmost puede mover la geometría
+
+    def snapshot(self):
+        """Guarda un PNG del fotograma actual y devuelve la ruta (o None)."""
+        if not VLC_OK or self.mp.get_media() is None:
+            return None
+        d = self.snapshot_dir
+        if not (d and os.path.isdir(d)):
+            d = _desktop_dir()
+        base = re.sub(r"[^\w\- ]", "", self.title_lbl.cget("text")).strip()[:40]
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = os.path.join(d, f"{base or 'piedrasonic'} {stamp}.png")
+        ok = self.mp.video_take_snapshot(0, path, 0, 0) == 0
+        self.btn_snap.configure(text="✓" if ok else "✕")
+        self.after(900, lambda: self.btn_snap.configure(text="📷"))
+        return path if ok else None
+
+    def set_panels_hidden(self, on):
+        """Refleja en el botón si las columnas laterales están ocultas."""
+        self.btn_panels.configure(text="▭" if on else "◧")
+
+    def _tick(self):
+        try:
+            ar = self._read_aspect()
+            if ar and abs(ar - self._ar) > 0.01:
+                self._ar = ar
+                if callable(self.on_aspect):
+                    self.on_aspect()
         except Exception:
             pass
         try:

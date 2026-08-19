@@ -31,7 +31,16 @@ se comparte).
 - **★ estrella** = favorito. En *Favoritos* se agrupan y ordenan (clic derecho o
   desplegable *Mover a*; multiselección con Ctrl/Shift).
 - **Doble clic** en el vídeo o `F11` = pantalla completa.
-- **Catch-up** (`-30m … -24h`) en los canales que lo soportan.
+- **`L`** (o **◧** en la barra de controles) = ocultar las dos columnas de
+  la izquierda y dejar solo el vídeo; la ventana se encoge sola para que la
+  imagen no cambie de tamaño ni de sitio. Otra vez y vuelven.
+- **`M`** (o **🔊**) = silenciar / recuperar. El volumen y el silencio se
+  recuerdan entre sesiones.
+- **`A`** (o **📌**) = ventana siempre encima.
+- **`S`** (o **📷**) = captura del fotograma (al *Escritorio*).
+- **Catch-up** (`-30m … -24h`) en los canales que lo soportan; con la caja
+  `min` saltas los minutos que quieras (`◀` atrás, `▶` adelante; llegar a 0
+  vuelve al directo).
 - **⚙ Cuenta** (abajo) para cambiar de servidor/credenciales.
 - **⚙** (arriba) para mostrar/ocultar categorías.
 - **Exportar M3U** para VLC/Kodi/TiviMate.
