@@ -11,6 +11,7 @@ import os
 import re
 import sys
 import json
+import time
 import threading
 from datetime import datetime, timedelta
 import tkinter as tk
@@ -179,7 +180,16 @@ class LiveApp(ctk.CTk):
                      font=font(12)).pack(fill=tk.X, padx=14, pady=(16, 8))
         self.count_lbl = ctk.CTkLabel(ch_col, text="CANALES", text_color=C["faint"],
                                       font=font(11, "bold"))
-        self.count_lbl.pack(anchor="w", padx=18, pady=(0, 6))
+        self.count_lbl.pack(anchor="w", padx=18, pady=(0, 2))
+
+        # Estado de sincronización de la lista. Existe porque el fallo mas
+        # desconcertante de este programa era justo este: si el servidor dejaba
+        # de responder, la interfaz seguia mostrando la lista guardada y todo
+        # parecia normal hasta que pulsabas un canal y salia negro. Un fallo de
+        # actualizacion tiene que VERSE.
+        self.sync_lbl = ctk.CTkLabel(ch_col, text="", text_color=C["muted"],
+                                     font=font(10), anchor="w", justify="left")
+        self.sync_lbl.pack(anchor="w", padx=18, pady=(0, 6), fill=tk.X)
 
         # barra de favoritos (solo visible en la vista Favoritos)
         self.fav_bar = ctk.CTkFrame(ch_col, fg_color="transparent")
@@ -287,29 +297,93 @@ class LiveApp(ctk.CTk):
     def load(self, force):
         threading.Thread(target=self._load, args=(force,), daemon=True).start()
 
-    def _load(self, force):
+    def _cache_age(self):
+        """Antigüedad de la lista guardada, en lenguaje llano."""
+        ts = None
         try:
-            if not force and os.path.exists(CACHE_PATH):
+            if os.path.exists(CACHE_PATH):
+                try:
+                    ts = json.load(open(CACHE_PATH, encoding="utf-8")).get("fetched_at")
+                except Exception:
+                    ts = None
+                ts = ts or os.path.getmtime(CACHE_PATH)
+        except OSError:
+            pass
+        if not ts:
+            return "antigüedad desconocida"
+        s = max(0.0, time.time() - ts)
+        if s < 90:
+            return "de hace un momento"
+        if s < 5400:
+            return f"de hace {int(s // 60)} min"
+        if s < 172800:
+            return f"de hace {int(s // 3600)} h"
+        return f"de hace {int(s // 86400)} días"
+
+    def _sync(self, text, color="muted"):
+        self.after(0, lambda: self.sync_lbl.configure(text=text, text_color=C[color]))
+
+    def _index_lists(self):
+        self.cat_name = {str(c["category_id"]): c["category_name"]
+                         for c in self.categories}
+        self.by_id = {str(s["stream_id"]): s for s in self.all_streams}
+        by = {}
+        for s in self.all_streams:
+            by.setdefault(str(s.get("category_id")), []).append(s)
+        self.streams_by_cat = by
+        self.after(0, self._populate)
+
+    def _load(self, force):
+        """Pinta la caché al instante y DESPUÉS habla siempre con el servidor.
+
+        Antes, si existía cache.json el programa no volvía a contactar con el
+        servidor nunca más: solo el refresco manual (F5) descargaba. Eso dejaba
+        la lista congelada indefinidamente y, peor todavía, hacía invisible que
+        el servidor hubiera dejado de autorizar la cuenta.
+
+        Ahora se hacen las dos cosas: la caché se muestra de inmediato para que
+        la ventana no se quede en blanco esperando a la red, y acto seguido se
+        descarga la lista en segundo plano. Si la descarga falla NO se borra lo
+        que ya había —seguirías pudiendo navegar—, pero el aviso se ve.
+        """
+        served = False
+        if not force and os.path.exists(CACHE_PATH):
+            try:
                 cache = json.load(open(CACHE_PATH, encoding="utf-8"))
                 self.categories = cache["categories"]
                 self.all_streams = cache["streams"]
-            else:
-                self.client.login()
-                self.categories = self.client.live_categories()
-                self.all_streams = self.client.live_streams()
-                json.dump({"categories": self.categories, "streams": self.all_streams},
-                          open(CACHE_PATH, "w", encoding="utf-8"), ensure_ascii=False)
-            self.cat_name = {str(c["category_id"]): c["category_name"]
-                             for c in self.categories}
-            self.by_id = {str(s["stream_id"]): s for s in self.all_streams}
-            by = {}
-            for s in self.all_streams:
-                by.setdefault(str(s.get("category_id")), []).append(s)
-            self.streams_by_cat = by
-            self.after(0, self._populate)
+                self._index_lists()
+                served = True
+            except Exception:
+                served = False
+
+        self._sync(f"Lista guardada {self._cache_age()} · actualizando…"
+                   if served else "Descargando lista de canales…")
+        try:
+            self.client.login()
+            cats = self.client.live_categories()
+            streams = self.client.live_streams()
+            if not streams:
+                raise RuntimeError("el servidor devolvió una lista vacía")
+            self.categories, self.all_streams = cats, streams
+            tmp = CACHE_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"fetched_at": time.time(), "categories": cats,
+                           "streams": streams}, fh, ensure_ascii=False)
+            os.replace(tmp, CACHE_PATH)
+            self._index_lists()
+            self._sync(f"Lista actualizada · {len(streams)} canales", "ok")
         except Exception as e:
-            self.after(0, lambda: messagebox.showerror(
-                "Error de conexión", f"No se pudo cargar la lista.\n\n{e}"))
+            msg = (str(e).strip() or type(e).__name__)[:90]
+            if served:
+                # Hay lista vieja utilizable: no molestamos con un diálogo, pero
+                # que quede bien claro que lo que se ve puede no ser válido.
+                self._sync(f"⚠  No se pudo actualizar · lista {self._cache_age()} · {msg}",
+                           "danger")
+            else:
+                self._sync(f"⚠  Sin lista de canales · {msg}", "danger")
+                self.after(0, lambda: messagebox.showerror(
+                    "Error de conexión", f"No se pudo cargar la lista.\n\n{msg}"))
 
     def _visible_streams(self):
         return [s for s in self.all_streams
