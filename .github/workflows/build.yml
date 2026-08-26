@@ -8,6 +8,11 @@ on:
 permissions:
   contents: write
 
+env:
+  # VLC que se empaqueta dentro del .exe. Fijado a proposito: una version
+  # concreta y verificada por hash es lo unico que hace la build reproducible.
+  VLC_VERSION: '3.0.23'
+
 jobs:
   build:
     runs-on: windows-latest
@@ -19,19 +24,44 @@ jobs:
           python-version: '3.12'
 
       - name: Instalar dependencias
-        run: pip install -r requirements.txt pyinstaller
+        run: pip install -r requirements.txt pyinstaller==6.22.2
 
-      - name: Compilar .exe
+      # El runner no trae VLC, y el que traen otros PCs suele ser de 32 bits.
+      # Se baja el zip oficial de 64 bits y se deja en vendor\vlc, que es lo
+      # primero que mira piedrasonic.spec.
+      - name: Descargar VLC de 64 bits
+        shell: pwsh
+        run: |
+          $base = "https://get.videolan.org/vlc/$env:VLC_VERSION/win64"
+          $zip  = "vlc-$env:VLC_VERSION-win64.zip"
+          Invoke-WebRequest "$base/$zip" -OutFile $zip
+          Invoke-WebRequest "$base/$zip.sha256" -OutFile "$zip.sha256"
+          $esperado = (Get-Content "$zip.sha256" -Raw).Split()[0].Trim()
+          $real = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($real -ne $esperado.ToLower()) {
+            throw "SHA256 de $zip no coincide: $real != $esperado"
+          }
+          Expand-Archive $zip -DestinationPath vendor
+          Move-Item "vendor\vlc-$env:VLC_VERSION" vendor\vlc
+          if (-not (Test-Path vendor\vlc\libvlc.dll)) { throw "vendor\vlc incompleto" }
+
+      - name: Compilar
         run: pyinstaller --noconfirm piedrasonic.spec
+
+      # Onedir: lo que se reparte es la carpeta entera comprimida. El .exe
+      # suelto no funciona sin _internal al lado.
+      - name: Comprimir
+        shell: pwsh
+        run: Compress-Archive -Path dist\piedrasonic\* -DestinationPath piedrasonic-windows-x64.zip
 
       - name: Subir artefacto
         uses: actions/upload-artifact@v4
         with:
-          name: piedrasonic-windows
-          path: dist/piedrasonic.exe
+          name: piedrasonic-windows-x64
+          path: piedrasonic-windows-x64.zip
 
       - name: Publicar Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/piedrasonic.exe
+          files: piedrasonic-windows-x64.zip

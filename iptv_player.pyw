@@ -35,6 +35,7 @@ ICON = os.path.join(RES_DIR, "icon.ico")
 
 STAR_ON = "⭐"
 STAR_OFF = "☆"
+RELOAD = "⟳"
 
 if sys.platform.startswith("win"):
     import ctypes
@@ -61,6 +62,12 @@ class LiveApp(ctk.CTk):
         theme.init()
         self.cfg = load_config()
         self._rebuild_client()
+        # La lista se pide AQUI, antes de crear un solo widget. Levantar la
+        # ventana de CustomTkinter cuesta un par de segundos; pidiendo ya la
+        # lista, esa espera y la ida y vuelta al servidor se solapan en vez de
+        # sumarse: cuando la ventana esta en pie, la respuesta suele estarlo.
+        if settings.has_credentials(self.cfg):
+            self._prefetch_start()
         self.favorites = set(str(x) for x in self.cfg.get("favorites", []))
         self.fav_groups = self.cfg.get("favorite_groups", [])   # [{name, channels[]}]
         self.hidden = set(str(x) for x in self.cfg.get("hidden_categories", []))
@@ -74,6 +81,8 @@ class LiveApp(ctk.CTk):
         self.cat_buttons = []
         self.cat_key = "all"
         self._first_load = True
+        self._loading = False         # hay una recarga de lista en curso
+        self._requeue = False         # ...y se pidio otra mientras corria
         self._fs = False
         self._panels_off = False      # modo solo-reproductor (atajo L)
         self._panels_w = 0            # ancho que ocupaban las dos columnas
@@ -98,11 +107,14 @@ class LiveApp(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build()
         if settings.has_credentials(self.cfg):
-            self.after(150, lambda: self.load(force=False))
+            self.after(0, lambda: self.load(force=False))
         else:
             self.after(200, lambda: self.open_account(first=True))
 
     def _rebuild_client(self):
+        # Un cambio de cuenta invalida una descarga adelantada en vuelo: sus
+        # datos son de OTRO servidor y no deben acabar pintados ni en la cache.
+        self._fetch = None
         self.client = XtreamClient(
             self.cfg.get("server", ""), self.cfg.get("username", ""),
             self.cfg.get("password", ""),
@@ -178,9 +190,20 @@ class LiveApp(ctk.CTk):
         ctk.CTkEntry(ch_col, textvariable=self.search_var, placeholder_text="Buscar canal…",
                      fg_color=C["surface2"], border_width=0, height=38,
                      font=font(12)).pack(fill=tk.X, padx=14, pady=(16, 8))
-        self.count_lbl = ctk.CTkLabel(ch_col, text="CANALES", text_color=C["faint"],
+        head = ctk.CTkFrame(ch_col, fg_color="transparent")
+        head.pack(fill=tk.X, padx=18, pady=(0, 2))
+        self.count_lbl = ctk.CTkLabel(head, text="CANALES", text_color=C["faint"],
                                       font=font(11, "bold"))
-        self.count_lbl.pack(anchor="w", padx=18, pady=(0, 2))
+        self.count_lbl.pack(side=tk.LEFT)
+        # La lista ya se actualiza sola en cada arranque, pero un servidor
+        # anade y quita canales a media tarde: hace falta poder volver a
+        # pedirla sin cerrar el programa. F5 hace exactamente lo mismo.
+        self.reload_btn = ctk.CTkButton(head, text=f"{RELOAD}  Actualizar",
+                                        width=108, height=26, corner_radius=8,
+                                        fg_color=C["surface2"], hover_color=C["hover"],
+                                        text_color=C["muted"], font=font(11),
+                                        command=lambda: self.load(force=True))
+        self.reload_btn.pack(side=tk.RIGHT)
 
         # Estado de sincronización de la lista. Existe porque el fallo mas
         # desconcertante de este programa era justo este: si el servidor dejaba
@@ -295,7 +318,51 @@ class LiveApp(ctk.CTk):
 
     # ------------------------------------------------------------------
     def load(self, force):
-        threading.Thread(target=self._load, args=(force,), daemon=True).start()
+        """Recarga la lista en segundo plano.
+
+        Una sola a la vez: el boton se puede pulsar repetidamente y F5 se
+        repite solo con dejarlo apretado, y dos hilos escribiendo cache.json a
+        la vez es justo lo que no queremos. Lo pedido mientras hay una en curso
+        no se tira, se relanza al terminar: importa al cambiar de cuenta con la
+        carga inicial todavia colgada del timeout del servidor viejo.
+        """
+        if self._loading:
+            self._requeue = True
+            return
+        self._loading = True
+        self._reload_ready(False)
+
+        def run():
+            try:
+                self._load(force)
+            finally:
+                self._loading = False
+                self._reload_ready(True)
+                self.after(0, self._drain_requeue)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _drain_requeue(self):
+        """Relanza la recarga que se pidio mientras habia otra en curso.
+
+        Corre en el hilo de Tk a proposito: `load` tambien, asi que las dos no
+        pueden entrelazarse y no hay manera de perder una peticion por haber
+        leido `_loading` justo cuando el hilo de trabajo lo estaba bajando.
+        """
+        if self._requeue:
+            self._requeue = False
+            self.load(force=True)
+
+    def _reload_ready(self, ready):
+        """Habilita o agrisa el boton de recarga (llamable desde otro hilo)."""
+        def apply():
+            btn = getattr(self, "reload_btn", None)
+            if btn is None:
+                return
+            btn.configure(state="normal" if ready else "disabled",
+                          text=f"{RELOAD}  Actualizar" if ready
+                               else f"{RELOAD}  …")
+        self.after(0, apply)
 
     def _cache_age(self):
         """Antigüedad de la lista guardada, en lenguaje llano."""
@@ -323,6 +390,48 @@ class LiveApp(ctk.CTk):
     def _sync(self, text, color="muted"):
         self.after(0, lambda: self.sync_lbl.configure(text=text, text_color=C[color]))
 
+    def _prefetch_start(self):
+        """Arranca la descarga de la lista antes de que exista la ventana.
+
+        No toca ni un widget (todavia no hay ninguno): deja el resultado en una
+        caja que `_fetch_lists` recoge cuando la interfaz ya esta construida.
+        """
+        box = {"done": threading.Event(), "data": None, "error": None}
+        self._fetch = box
+
+        def run():
+            try:
+                box["data"] = self._download_lists()
+            except Exception as e:               # se reporta al recogerla
+                box["error"] = e
+            finally:
+                box["done"].set()
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _download_lists(self):
+        """Categorias y canales del servidor. Solo red: no toca la interfaz."""
+        self.client.login()
+        cats = self.client.live_categories()
+        streams = self.client.live_streams()
+        if not streams:
+            # Una lista vacia no es una lista: sobrescribir la cache con esto
+            # dejaria al usuario sin canales y sin nada a lo que volver.
+            raise RuntimeError("el servidor devolvió una lista vacía")
+        return cats, streams
+
+    def _fetch_lists(self):
+        """Como `_download_lists`, pero aprovecha la descarga adelantada del
+        arranque si sigue disponible. Se consume: solo sirve una vez.
+        """
+        pending, self._fetch = self._fetch, None
+        if pending is None:
+            return self._download_lists()
+        pending["done"].wait()
+        if pending["error"] is not None:
+            raise pending["error"]
+        return pending["data"]
+
     def _index_lists(self):
         self.cat_name = {str(c["category_id"]): c["category_name"]
                          for c in self.categories}
@@ -342,11 +451,13 @@ class LiveApp(ctk.CTk):
         el servidor hubiera dejado de autorizar la cuenta.
 
         Ahora se hacen las dos cosas: la caché se muestra de inmediato para que
-        la ventana no se quede en blanco esperando a la red, y acto seguido se
-        descarga la lista en segundo plano. Si la descarga falla NO se borra lo
-        que ya había —seguirías pudiendo navegar—, pero el aviso se ve.
+        la ventana no se quede en blanco esperando a la red, y la lista se pide
+        siempre. En el arranque ni siquiera se pide aquí: ya venía pedida de
+        antes de construir la ventana (`_prefetch_start`), y `_fetch_lists` se
+        limita a recoger el resultado. Si la descarga falla NO se borra lo que
+        ya había —seguirías pudiendo navegar—, pero el aviso se ve.
         """
-        served = False
+        served = False              # se ha llegado a pintar la caché al entrar
         if not force and os.path.exists(CACHE_PATH):
             try:
                 cache = json.load(open(CACHE_PATH, encoding="utf-8"))
@@ -360,11 +471,7 @@ class LiveApp(ctk.CTk):
         self._sync(f"Lista guardada {self._cache_age()} · actualizando…"
                    if served else "Descargando lista de canales…")
         try:
-            self.client.login()
-            cats = self.client.live_categories()
-            streams = self.client.live_streams()
-            if not streams:
-                raise RuntimeError("el servidor devolvió una lista vacía")
+            cats, streams = self._fetch_lists()
             self.categories, self.all_streams = cats, streams
             tmp = CACHE_PATH + ".tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
@@ -375,9 +482,16 @@ class LiveApp(ctk.CTk):
             self._sync(f"Lista actualizada · {len(streams)} canales", "ok")
         except Exception as e:
             msg = (str(e).strip() or type(e).__name__)[:90]
-            if served:
-                # Hay lista vieja utilizable: no molestamos con un diálogo, pero
-                # que quede bien claro que lo que se ve puede no ser válido.
+            if self.all_streams:
+                # Hay lista utilizable en pantalla: no molestamos con un
+                # diálogo, pero que quede claro que puede estar caducada.
+                #
+                # La condición es «hay canales», no «acabo de pintar la
+                # caché». Con el botón de Actualizar el usuario provoca
+                # recargas forzadas a media sesión, que no pasan por la
+                # caché; mirando lo segundo, un servidor que fallara justo
+                # al pulsarlo anunciaba «Sin lista de canales» y sacaba un
+                # diálogo de error con los canales ahí delante, intactos.
                 self._sync(f"⚠  No se pudo actualizar · lista {self._cache_age()} · {msg}",
                            "danger")
             else:

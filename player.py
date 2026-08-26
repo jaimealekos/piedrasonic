@@ -45,6 +45,28 @@ def _dll_bits(path):
     return {0x014C: 32, 0x8664: 64, 0xAA64: 64}.get(machine)
 
 
+def _use_vlc(d):
+    """Deja el entorno listo para que `import vlc` cargue el VLC de `d`.
+
+    Son las tres cosas que hay que hacer SIEMPRE, venga la carpeta de donde
+    venga: ruta absoluta a la DLL (si no, el hook de ctypes de PyInstaller la
+    busca dentro del bundle), carpeta de plugins, y add_dll_directory para que
+    libvlccore.dll —que vive al lado— tambien se encuentre.
+    """
+    os.environ["PYTHON_VLC_LIB_PATH"] = os.path.join(d, "libvlc.dll")
+    plugins = os.path.join(d, "plugins")
+    if os.path.isdir(plugins):
+        os.environ.setdefault("PYTHON_VLC_MODULE_PATH", plugins)
+        os.environ.setdefault("VLC_PLUGIN_PATH", plugins)
+    add = getattr(os, "add_dll_directory", None)       # Python 3.8+
+    if add is not None:
+        try:
+            add(d)
+        except OSError:
+            pass
+    return d
+
+
 def _prepare_vlc():
     """Localiza VLC y prepara el entorno ANTES de importar `vlc`.
 
@@ -65,7 +87,11 @@ def _prepare_vlc():
     """
     lib = os.environ.get("PYTHON_VLC_LIB_PATH")
     if lib and os.path.isfile(lib):
-        return os.path.dirname(lib)
+        # Ojo: tambien por aqui hay que pasar por _use_vlc. Antes esta rama
+        # devolvia la carpeta y ya, sin add_dll_directory ni ruta de plugins,
+        # con lo que la unica salida de emergencia que ofrece el mensaje de
+        # error ("define PYTHON_VLC_LIB_PATH") no llegaba a funcionar.
+        return _use_vlc(os.path.dirname(lib))
 
     candidates = []
     # Si el .exe trae VLC empaquetado, tiene prioridad sobre lo que haya
@@ -109,18 +135,7 @@ def _prepare_vlc():
         if bits and bits != (8 * struct.calcsize("P")):
             wrong_arch.append((d, bits))
             continue
-        os.environ["PYTHON_VLC_LIB_PATH"] = dll
-        plugins = os.path.join(d, "plugins")
-        if os.path.isdir(plugins):
-            os.environ.setdefault("PYTHON_VLC_MODULE_PATH", plugins)
-            os.environ.setdefault("VLC_PLUGIN_PATH", plugins)
-        add = getattr(os, "add_dll_directory", None)   # Python 3.8+
-        if add is not None:
-            try:
-                add(d)
-            except OSError:
-                pass
-        return d
+        return _use_vlc(d)
 
     global VLC_HINT
     mine = 8 * struct.calcsize("P")
