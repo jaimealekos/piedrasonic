@@ -411,9 +411,7 @@ class LiveApp(ctk.CTk):
 
     def _download_lists(self):
         """Categorias y canales del servidor. Solo red: no toca la interfaz."""
-        self.client.login()
-        cats = self.client.live_categories()
-        streams = self.client.live_streams()
+        cats, streams = self.client.catalog()
         if not streams:
             # Una lista vacia no es una lista: sobrescribir la cache con esto
             # dejaria al usuario sin canales y sin nada a lo que volver.
