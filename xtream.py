@@ -33,14 +33,30 @@ _SSL.verify_mode = ssl.CERT_NONE
 # code: 1010" a las peticiones sin User-Agent, asi que nunca se manda vacio.
 UA_POR_DEFECTO = "VLC/3.0.20 LibVLC/3.0.20"
 
+# A donde redirige Cloudflare cuando corta el video. Ese dominio resuelve a
+# 127.0.0.1, o sea que el reproductor acaba conectandose a si mismo y lo unico
+# que se ve es un error de conexion que no dice nada de la causa real.
+CF_ABUSO = "cloudflare-terms-of-service-abuse"
+
+# Formato de directo por defecto. HLS y no TS: el TS crudo es justo lo que los
+# CDN reconocen y cortan; el .m3u8 se sirve desde el origen y pasa.
+SALIDA_POR_DEFECTO = "m3u8"
+
 
 class XtreamError(Exception):
     pass
 
 
+class _NoSigasRedirecciones(urllib.request.HTTPRedirectHandler):
+    """Deja que las redirecciones lleguen como HTTPError, para poder leerlas."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 class XtreamClient:
     def __init__(self, server, username, password,
-                 user_agent=UA_POR_DEFECTO, output="ts", timeout=25):
+                 user_agent=UA_POR_DEFECTO, output=SALIDA_POR_DEFECTO, timeout=25):
         self.server = server.rstrip("/")
         self.username = username
         self.password = password
@@ -180,6 +196,65 @@ class XtreamClient:
             if "v" not in caja:
                 raise XtreamError(f"el servidor no respondio a tiempo ({nombre})")
         return tareas["categorias"][1]["v"], tareas["canales"][1]["v"]
+
+    # ---- que formato de directo sirve de verdad este servidor ----------
+    def _sonda_directo(self, url):
+        """Abre una URL de directo y mira si sale video, sin bajarse el canal.
+
+        Las redirecciones se siguen a mano a proposito: hay que VER a donde
+        manda el servidor. Cuando Cloudflare corta el video —su contrato no
+        permite repartir television por su CDN— responde 302 hacia
+        www.cloudflare-terms-of-service-abuse.com, que resuelve a 127.0.0.1.
+        Siguiendola sin mirar, el fallo llega disfrazado de "conexion
+        rechazada" y parece cosa de la red del usuario o del reproductor.
+
+        Devuelve (sirve, explicacion).
+        """
+        sin_saltos = urllib.request.build_opener(_NoSigasRedirecciones)
+        for _ in range(5):
+            req = urllib.request.Request(url, headers={"User-Agent": self.user_agent})
+            try:
+                r = sin_saltos.open(req, timeout=min(self.timeout, 12))
+                cabeza = r.read(1024)
+                r.close()
+            except urllib.error.HTTPError as e:
+                destino = e.headers.get("Location") if e.headers else None
+                if e.code in (301, 302, 303, 307, 308) and destino:
+                    if CF_ABUSO in destino:
+                        return False, ("el CDN (Cloudflare) esta bloqueando el video "
+                                       "en este formato")
+                    url = urllib.parse.urljoin(url, destino)
+                    continue
+                return False, f"el servidor respondio HTTP {e.code}"
+            except Exception as e:
+                return False, f"{type(e).__name__}: {str(e)[:60]}"
+            if cabeza.startswith(b"#EXTM3U"):
+                return True, "lista HLS"
+            if cabeza[:1] == b"\x47":
+                return True, "flujo MPEG-TS"
+            return False, "la respuesta no es ni HLS ni MPEG-TS"
+        return False, "demasiadas redirecciones"
+
+    def formato_que_funciona(self, stream_id, candidatos=None):
+        """Cual de los formatos de directo entrega video en este servidor.
+
+        Existe porque un panel puede tener la lista perfectamente accesible y
+        el video cortado: son caminos distintos, y el segundo puede estar
+        bloqueado por el CDN que hay delante. Se prueba primero el configurado,
+        para no cambiar nada cuando ya va bien.
+
+        Devuelve (extension, explicacion) o (None, explicacion del ultimo).
+        """
+        orden = list(candidatos or ([self.output] if self.output else []))
+        for ext in ("m3u8", "ts"):
+            if ext not in orden:
+                orden.append(ext)
+        motivo = "sin probar"
+        for ext in orden:
+            sirve, motivo = self._sonda_directo(self.live_url(stream_id, ext))
+            if sirve:
+                return ext, motivo
+        return None, motivo
 
     # ---- EPG -----------------------------------------------------------
     def short_epg(self, stream_id, limit=6):

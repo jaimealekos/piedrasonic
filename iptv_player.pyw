@@ -21,7 +21,7 @@ import customtkinter as ctk
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import theme
 from theme import C, font
-from xtream import XtreamClient
+from xtream import XtreamClient, SALIDA_POR_DEFECTO
 from player import VlcPlayer, VLC_OK
 import settings
 from settings import load_config, save_config
@@ -81,6 +81,7 @@ class LiveApp(ctk.CTk):
         self.cat_buttons = []
         self.cat_key = "all"
         self._first_load = True
+        self._formato_ok = False      # ya se comprobo que el video se ve
         self._loading = False         # hay una recarga de lista en curso
         self._requeue = False         # ...y se pidio otra mientras corria
         self._fs = False
@@ -119,7 +120,7 @@ class LiveApp(ctk.CTk):
             self.cfg.get("server", ""), self.cfg.get("username", ""),
             self.cfg.get("password", ""),
             user_agent=self.cfg.get("user_agent", "VLC/3.0"),
-            output=self.cfg.get("output", "ts"))
+            output=self.cfg.get("output") or SALIDA_POR_DEFECTO)
 
     def open_account(self, first=False):
         def on_success(server, user, password):
@@ -133,6 +134,7 @@ class LiveApp(ctk.CTk):
             except OSError:
                 pass
             self._first_load = True
+            self._formato_ok = False       # otro servidor, otra comprobacion
             self.load(force=True)
         settings.account_dialog(self, self.cfg, on_success, first=first, icon=ICON)
 
@@ -478,6 +480,7 @@ class LiveApp(ctk.CTk):
             os.replace(tmp, CACHE_PATH)
             self._index_lists()
             self._sync(f"Lista actualizada · {len(streams)} canales", "ok")
+            self._verificar_formato(streams)
         except Exception as e:
             msg = (str(e).strip() or type(e).__name__)[:90]
             if self.all_streams:
@@ -496,6 +499,40 @@ class LiveApp(ctk.CTk):
                 self._sync(f"⚠  Sin lista de canales · {msg}", "danger")
                 self.after(0, lambda: messagebox.showerror(
                     "Error de conexión", f"No se pudo cargar la lista.\n\n{msg}"))
+
+    def _verificar_formato(self, streams):
+        """Comprueba que los canales se pueden ver, no solo listar.
+
+        Listar y reproducir van por caminos distintos: la lista puede llegar
+        perfecta y el video estar cortado. Pasa cuando el panel esta detras de
+        un CDN —Cloudflare no permite repartir television por su red— que deja
+        pasar la API y corta el flujo de video, redirigiendolo a un dominio que
+        resuelve a 127.0.0.1. El sintoma es demoledor por lo mudo que es:
+        estan los 1737 canales en su sitio y ninguno arranca.
+
+        Se prueba UNA vez por sesion, ya con la lista pintada, y si el formato
+        configurado no sirve pero otro si, se cambia y se recuerda.
+        """
+        if self._formato_ok or not streams:
+            return
+        self._formato_ok = True                  # una sola vez, salga lo que salga
+        actual = self.cfg.get("output") or SALIDA_POR_DEFECTO
+        try:
+            ext, motivo = self.client.formato_que_funciona(streams[0]["stream_id"])
+        except Exception:
+            return                               # una sonda que falla no molesta
+        if ext is None:
+            self._sync(f"⚠  La lista carga pero el vídeo no: {motivo}", "danger")
+            return
+        if ext != actual:
+            self.cfg["output"] = ext
+            try:
+                save_config(self.cfg)
+            except Exception:
+                pass
+            self._rebuild_client()
+            self._sync(f"Lista actualizada · {len(streams)} canales "
+                       f"· vídeo por {ext.upper()}", "ok")
 
     def _visible_streams(self):
         return [s for s in self.all_streams
