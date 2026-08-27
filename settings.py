@@ -127,7 +127,11 @@ def unprotect(s):
 # --- config ---------------------------------------------------------------
 def load_config():
     try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        # utf-8-sig y no utf-8: si algo reescribe config.json con BOM -el
+        # Bloc de notas, PowerShell, cualquier editor de Windows- json.load
+        # revienta con utf-8 a secas, y aqui eso se traduce en perder la
+        # cuenta sin decir nada y volver a pedir usuario y contrasena.
+        with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
             cfg = json.load(f)
     except Exception:
         cfg = {}
