@@ -12,6 +12,15 @@ Cada cambio nuevo se apunta arriba, en el momento de hacerlo.
 
 Rama `fix/vlc-bundle-and-playlist-refresh`. Cuatro commits hechos y sin empujar.
 
+### 28 de agosto de 2026 — El hash de VLC va en el workflow, no se baja
+La primera build de la v1.4.0 murió bajando VLC. `get.videolan.org` reparte con
+una redirección a un espejo; `Invoke-WebRequest` acabó guardando algo que no era
+el zip y el fichero `.sha256` llegó vacío, así que la comparación se hizo contra
+una cadena en blanco. Ahora el hash está escrito en el propio workflow —lo que
+además hace la build reproducible de verdad—, se baja con `curl -fL`, que
+revienta si lo que llega es un error, y se comprueba que el fichero pesa lo que
+tiene que pesar antes de mirar nada más.
+
 ### 28 de agosto de 2026 — La lista se llena a la vista, y se usa desde el primer canal
 La lista ya no aparece con los canales de la última vez mientras se descarga la
 nueva: **empieza vacía y se llena de verdad**. Se pide una petición por

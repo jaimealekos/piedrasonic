@@ -12,6 +12,11 @@ env:
   # VLC que se empaqueta dentro del .exe. Fijado a proposito: una version
   # concreta y verificada por hash es lo unico que hace la build reproducible.
   VLC_VERSION: '3.0.23'
+  # El hash va AQUI y no se baja del servidor. Bajarlo del mismo sitio que el
+  # fichero no protege de gran cosa, y ademas fue lo que rompio la primera
+  # build: get.videolan.org reparte con una redireccion a un espejo, el
+  # .sha256 llego vacio y la comparacion fallo contra una cadena en blanco.
+  VLC_SHA256: '992d19dbd0b8a7cde9167d2f7780b1ef6f92acc8a71acfa736101a21f35181e1'
 
 jobs:
   build:
@@ -32,15 +37,20 @@ jobs:
       - name: Descargar VLC de 64 bits
         shell: pwsh
         run: |
-          $base = "https://get.videolan.org/vlc/$env:VLC_VERSION/win64"
-          $zip  = "vlc-$env:VLC_VERSION-win64.zip"
-          Invoke-WebRequest "$base/$zip" -OutFile $zip
-          Invoke-WebRequest "$base/$zip.sha256" -OutFile "$zip.sha256"
-          $esperado = (Get-Content "$zip.sha256" -Raw).Split()[0].Trim()
+          $zip = "vlc-$env:VLC_VERSION-win64.zip"
+          # curl y no Invoke-WebRequest: get.videolan.org contesta con una
+          # redireccion a un espejo, y hace falta seguirla Y reventar si lo que
+          # llega no es el fichero. Con -f un error HTTP es un error, no una
+          # pagina guardada en disco con nombre de zip.
+          curl.exe -fLsS --retry 5 --retry-all-errors --retry-delay 3 `
+                   -o $zip "https://get.videolan.org/vlc/$env:VLC_VERSION/win64/$zip"
+          $peso = (Get-Item $zip).Length
+          if ($peso -lt 30MB) { throw "$zip solo pesa $peso bytes: eso no es VLC" }
           $real = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-          if ($real -ne $esperado.ToLower()) {
-            throw "SHA256 de $zip no coincide: $real != $esperado"
+          if ($real -ne $env:VLC_SHA256.ToLower()) {
+            throw "SHA256 de $zip no coincide.`n  esperado: $env:VLC_SHA256`n  recibido: $real"
           }
+          Write-Host "VLC $env:VLC_VERSION verificado ($([math]::Round($peso/1MB)) MB)"
           Expand-Archive $zip -DestinationPath vendor
           Move-Item "vendor\vlc-$env:VLC_VERSION" vendor\vlc
           if (-not (Test-Path vendor\vlc\libvlc.dll)) { throw "vendor\vlc incompleto" }
