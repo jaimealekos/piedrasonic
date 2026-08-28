@@ -18,14 +18,50 @@ import customtkinter as ctk
 from theme import C, font
 from xtream import XtreamClient
 
-# Rutas: cuando corre empaquetado (PyInstaller) los recursos van en _MEIPASS
-# (solo lectura) y los datos del usuario (config) junto al .exe (escribible).
-if getattr(sys, "frozen", False):
-    DATA_DIR = os.path.dirname(sys.executable)
-    RES_DIR = getattr(sys, "_MEIPASS", DATA_DIR)
-else:
-    DATA_DIR = os.path.dirname(os.path.abspath(__file__))
-    RES_DIR = DATA_DIR
+
+# Rutas: empaquetado (PyInstaller) los recursos van en _MEIPASS (solo lectura) y
+# los datos del usuario junto al .exe, o en %LOCALAPPDATA% si ahi no se escribe.
+def _writable(d):
+    """Si se puede escribir de verdad en `d`.
+
+    Se prueba escribiendo. `os.access` miente en Windows: con la
+    virtualizacion de UAC dice que si en sitios donde el primer open() falla.
+    """
+    probe = os.path.join(d, ".piedrasonic-write-test")
+    try:
+        with open(probe, "w"):
+            pass
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def _data_dir():
+    """Donde guardar config.json y cache.json.
+
+    Junto al .exe mientras se pueda, que es lo comodo: mueves la carpeta a otro
+    PC y la cuenta y la lista se van con ella. Pero descomprimido en Archivos
+    de programa —o en cualquier sitio protegido— ahi no se escribe, y el
+    programa se quedaria sin recordar ni la cuenta ni el volumen sin decir por
+    que. En ese caso se cae a %LOCALAPPDATA%\\piedrasonic.
+    """
+    if not getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(__file__))
+    beside = os.path.dirname(sys.executable)
+    if _writable(beside):
+        return beside
+    home = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    fallback = os.path.join(home, "piedrasonic")
+    try:
+        os.makedirs(fallback, exist_ok=True)
+    except OSError:
+        return beside            # no hay a donde ir: que falle a la vista
+    return fallback
+
+
+DATA_DIR = _data_dir()
+RES_DIR = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
 
 APP_DIR = DATA_DIR
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
@@ -91,7 +127,11 @@ def unprotect(s):
 # --- config ---------------------------------------------------------------
 def load_config():
     try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        # utf-8-sig y no utf-8: si algo reescribe config.json con BOM -el
+        # Bloc de notas, PowerShell, cualquier editor de Windows- json.load
+        # revienta con utf-8 a secas, y aqui eso se traduce en perder la
+        # cuenta sin decir nada y volver a pedir usuario y contrasena.
+        with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
             cfg = json.load(f)
     except Exception:
         cfg = {}

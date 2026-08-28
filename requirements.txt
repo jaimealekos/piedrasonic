@@ -1,3 +1,6 @@
-customtkinter
-python-vlc
-pillow
+# Fijadas a lo que se compila y se prueba. customtkinter cambia el aspecto de
+# la ventana entre versiones menores, y no queremos que el .exe de manana se
+# vea distinto del de hoy por una actualizacion que nadie ha pedido.
+customtkinter==6.0.0
+python-vlc==3.0.21203
+pillow==12.3.0

@@ -12,3 +12,7 @@ __pycache__/
 # PyInstaller
 build/
 dist/
+
+# VLC de 64 bits del que tira el empaquetado (110 MB, no se versiona:
+# se baja el zip oficial de videolan.org y se descomprime aqui)
+vendor/

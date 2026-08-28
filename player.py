@@ -27,7 +27,138 @@ import tkinter as tk
 import customtkinter as ctk
 from theme import C, font
 
+import struct
+
+VLC_HINT = ""     # explicacion legible si no se pudo localizar VLC
+
+
+def _dll_bits(path):
+    """32 o 64 segun la cabecera PE de la DLL, o None si no se puede leer."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0x3C)
+            pe = struct.unpack("<I", fh.read(4))[0]
+            fh.seek(pe + 4)
+            machine = struct.unpack("<H", fh.read(2))[0]
+    except (OSError, struct.error):
+        return None
+    return {0x014C: 32, 0x8664: 64, 0xAA64: 64}.get(machine)
+
+
+def _use_vlc(d):
+    """Deja el entorno listo para que `import vlc` cargue el VLC de `d`.
+
+    Son las tres cosas que hay que hacer SIEMPRE, venga la carpeta de donde
+    venga: ruta absoluta a la DLL (si no, el hook de ctypes de PyInstaller la
+    busca dentro del bundle), carpeta de plugins, y add_dll_directory para que
+    libvlccore.dll —que vive al lado— tambien se encuentre.
+    """
+    os.environ["PYTHON_VLC_LIB_PATH"] = os.path.join(d, "libvlc.dll")
+    plugins = os.path.join(d, "plugins")
+    if os.path.isdir(plugins):
+        os.environ.setdefault("PYTHON_VLC_MODULE_PATH", plugins)
+        os.environ.setdefault("VLC_PLUGIN_PATH", plugins)
+    add = getattr(os, "add_dll_directory", None)       # Python 3.8+
+    if add is not None:
+        try:
+            add(d)
+        except OSError:
+            pass
+    return d
+
+
+def _prepare_vlc():
+    """Localiza VLC y prepara el entorno ANTES de importar `vlc`.
+
+    Congelado con PyInstaller esto es obligatorio, por dos motivos que se suman:
+
+    1. El hook de ctypes de PyInstaller intercepta `ctypes.CDLL` y, ante un
+       nombre relativo como 'libvlc.dll' o '.\\libvlc.dll' (que es justo lo que
+       usa el parche interno de python-vlc), busca dentro del bundle en vez de
+       en el sistema. Al no encontrarlo lanza el famoso
+       "Failed to load dynlib/dll ... most likely this dynlib/dll was not found
+       when the application was frozen". Con una ruta ABSOLUTA no interfiere.
+
+    2. Desde Python 3.8, Windows ya no resuelve las DLL dependientes por el PATH
+       ni por el directorio actual. Aunque libvlc.dll cargue, `libvlccore.dll`
+       —que vive a su lado— no se encontraria. De ahi el `add_dll_directory`.
+
+    Devuelve el directorio de VLC, o None si no hay instalacion.
+    """
+    lib = os.environ.get("PYTHON_VLC_LIB_PATH")
+    if lib and os.path.isfile(lib):
+        # Ojo: tambien por aqui hay que pasar por _use_vlc. Antes esta rama
+        # devolvia la carpeta y ya, sin add_dll_directory ni ruta de plugins,
+        # con lo que la unica salida de emergencia que ofrece el mensaje de
+        # error ("define PYTHON_VLC_LIB_PATH") no llegaba a funcionar.
+        return _use_vlc(os.path.dirname(lib))
+
+    candidates = []
+    # Si el .exe trae VLC empaquetado, tiene prioridad sobre lo que haya
+    # instalado en la maquina: es la unica forma de no depender de la version ni
+    # de la arquitectura del PC ajeno.
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        candidates.append(os.path.join(base, "vlc"))
+    if sys.platform.startswith("win"):
+        try:
+            import winreg
+            for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                for sub in (r"SOFTWARE\VideoLAN\VLC",
+                            r"SOFTWARE\WOW6432Node\VideoLAN\VLC"):
+                    try:
+                        with winreg.OpenKey(root, sub) as k:
+                            d, _ = winreg.QueryValueEx(k, "InstallDir")
+                            if d:
+                                candidates.append(d)
+                    except OSError:
+                        pass
+        except ImportError:
+            pass
+        for var in ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"):
+            base = os.environ.get(var)
+            if base:
+                candidates.append(os.path.join(base, "VideoLAN", "VLC"))
+
+    wrong_arch = []
+    for d in candidates:
+        dll = os.path.join(d, "libvlc.dll")
+        if not os.path.isfile(dll):
+            continue
+        # Comprobacion de arquitectura ANTES de intentar cargarla. Es la causa
+        # numero uno del fallo en un PC ajeno: videolan.org ha servido durante
+        # anos el instalador de 32 bits por defecto, asi que mucha gente "tiene
+        # VLC instalado" pero es x86 y un .exe de 64 bits no puede cargar esa
+        # DLL jamas. Sin esta comprobacion el usuario solo ve un error de
+        # ctypes que no dice nada.
+        bits = _dll_bits(dll)
+        if bits and bits != (8 * struct.calcsize("P")):
+            wrong_arch.append((d, bits))
+            continue
+        return _use_vlc(d)
+
+    global VLC_HINT
+    mine = 8 * struct.calcsize("P")
+    if wrong_arch:
+        d, bits = wrong_arch[0]
+        VLC_HINT = (
+            f"VLC encontrado en {d} es de {bits} bits y esta aplicacion es de "
+            f"{mine} bits: son incompatibles.\n\n"
+            f"Instala VLC de {mine} bits desde videolan.org (en la pagina de "
+            f"descarga, elige explicitamente la version de {mine} bits).")
+    else:
+        VLC_HINT = (
+            "No se ha encontrado ninguna instalacion de VLC.\n\n"
+            "Instala VLC desde videolan.org, o define la variable de entorno "
+            "PYTHON_VLC_LIB_PATH con la ruta completa a libvlc.dll.")
+    return None
+
+
+VLC_DIR = _prepare_vlc()
+
 try:
+    if VLC_DIR is None and sys.platform.startswith("win"):
+        raise RuntimeError(VLC_HINT)
     import vlc
     VLC_OK = True
     VLC_ERR = None
@@ -158,6 +289,23 @@ class VlcPlayer(ctk.CTkFrame):
         args = ["--no-video-title-show", "--quiet", "--intf", "dummy",
                 f"--network-caching={network_caching}",
                 f"--http-user-agent={user_agent}"]
+
+        # Modo diagnostico: PIEDRASONIC_DEBUG=1 hace que VLC escriba un log
+        # detallado junto al ejecutable. Es la unica forma de saber que pasa en
+        # un PC ajeno: si el decodificador arranca, que salida de video elige,
+        # y si algun modulo falla al cargar. Sin esto, un vídeo en negro no
+        # distingue entre "no llega el stream", "no decodifica" y "decodifica
+        # pero no pinta".
+        if os.environ.get("PIEDRASONIC_DEBUG"):
+            base = os.path.dirname(sys.executable if getattr(sys, "frozen", False)
+                                   else os.path.abspath(__file__))
+            self.log_path = os.path.join(base, "piedrasonic-vlc.log")
+            args = [a for a in args if a != "--quiet"]
+            args += ["--verbose=2", "--file-logging", f"--logfile={self.log_path}",
+                     "--log-verbose=2"]
+        else:
+            self.log_path = None
+
         self.instance = vlc.Instance(args) if VLC_OK else None
         self.mp = self.instance.media_player_new() if VLC_OK else None
 
