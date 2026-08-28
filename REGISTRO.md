@@ -12,6 +12,26 @@ Cada cambio nuevo se apunta arriba, en el momento de hacerlo.
 
 Rama `fix/vlc-bundle-and-playlist-refresh`. Cuatro commits hechos y sin empujar.
 
+### 28 de agosto de 2026 — La lista se llena a la vista, y se usa desde el primer canal
+La lista ya no aparece con los canales de la última vez mientras se descarga la
+nueva: **empieza vacía y se llena de verdad**. Se pide una petición por
+categoría —seis a la vez, la más gorda primero— y cada respuesta se lee a
+trozos, porque el panel las manda según las genera. Contra el servidor real: la
+ventana tiene 321 canales usables a los **0,6 s** y el primero suena a los
+**0,5 s**, donde antes había 28 segundos de nada. El total sigue siendo 28 s y
+no hay manera de bajarlo: una sola categoría trae 1382 de los 1737 canales.
+
+Se ve: barra de progreso con el final bien puesto (el panel dice cuántos
+canales tiene cada categoría y acierta), cada categoría con su barrita de color
+haciendo de medidor que se llena, y un cartel mientras no hay nada. Todo lo que
+aparece se puede usar ya, y lo que elija el usuario manda sobre el arranque
+automático.
+
+Comprobado con 15 pruebas del cliente contra el panel real, 21 de la aplicación
+entera con ventana y mainloop, 26 más de averías —categoría caída, servidor
+muerto, buscador a media carga, cambio de cuenta en vuelo— cada una en su
+proceso, y tres arranques cronometrados contra el servidor de verdad.
+
 ### 28 de agosto de 2026 — Bitácora y registro
 Se crean `BITACORA.md` (qué es el proyecto, cómo está hecho, en qué punto está y
 las normas) y este `REGISTRO.md`. Se añade un `CLAUDE.md` de tres líneas que

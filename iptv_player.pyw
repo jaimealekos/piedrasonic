@@ -12,6 +12,7 @@ import re
 import sys
 import json
 import time
+import queue
 import threading
 from datetime import datetime, timedelta
 import tkinter as tk
@@ -56,18 +57,173 @@ CH_MIN = 330            # ancho mínimo de la columna de canales
 MIN_W, MIN_H = 1040, 640                  # tamaño mínimo de la ventana
 
 
+def _texto_error(e):
+    return (str(e).strip() or type(e).__name__)[:90]
+
+
+class _Descarga:
+    """Baja la lista por categorias y va soltando lo que trae segun llega.
+
+    El motivo esta medido contra el panel de este proyecto: pedir la lista
+    entera de una vez tarda 27,6 s, y de esos, 27,6 son UNA categoria
+    ("Latinos", 1382 de los 1737 canales). Las otras nueve contestan en
+    0,13-0,16 s cada una. Pidiendolas por separado el total no baja —eso ya se
+    comprobo y sigue siendo verdad—, pero a los 0,42 s el usuario tiene 355
+    canales delante y funcionando en vez de una ventana vacia durante medio
+    minuto. Y la gorda tampoco llega de golpe: el panel la va soltando, asi que
+    a los 7,4 s hay ya varios cientos mas.
+
+    Todo lo que produce sale por una cola de eventos. Aqui NO se toca ni un
+    widget: Tk solo aguanta que lo toque su propio hilo, y los fallos de
+    hacerlo desde otro no son excepciones limpias, son cuelgues raros que no
+    hay manera de reproducir. La ventana vacia esa cola cuando le viene bien.
+
+    Eventos: ("categorias", lista) · ("empieza", cid) · ("canales", cid, lote)
+             ("lista", cid, completa) · ("falla", cid, motivo) · ("fin", info)
+    """
+
+    def __init__(self, cliente, esperado=None, ocultas=(), hilos=6):
+        self.cliente = cliente
+        self.cola = queue.Queue()
+        self.esperado = dict(esperado or {})   # cid -> lo que tenia la ultima vez
+        self.ocultas = set(ocultas or ())
+        self.hilos = hilos
+        self._corta = threading.Event()
+        self._entero = None       # cid del que descubrio que el panel no filtra
+        self._cerrojo = threading.Lock()
+
+    # -- vida ----------------------------------------------------------
+    def arranca(self):
+        threading.Thread(target=self._corre, daemon=True).start()
+        return self
+
+    def cancela(self):
+        """Abandona la descarga. Los hilos vivos mueren en cuanto respiran.
+
+        No es instantaneo: un hilo parado esperando el primer byte de la
+        categoria gorda no se entera hasta que ese byte llega, y pueden ser
+        siete segundos. Da igual: son hilos demonio y lo que traigan se tira,
+        porque la ventana solo hace caso a la descarga que tiene en la mano.
+        """
+        self._corta.set()
+
+    @property
+    def cancelada(self):
+        return self._corta.is_set()
+
+    # -- trabajo ---------------------------------------------------------
+    def _corre(self):
+        try:
+            cats = self._login_y_categorias()
+        except Exception as e:
+            self.cola.put(("fin", {"ok": False, "error": _texto_error(e)}))
+            return
+        if self._corta.is_set():
+            return
+        self.cola.put(("categorias", cats))
+
+        ids = [str(c["category_id"]) for c in cats]
+        if not ids:
+            ids = [None]          # panel sin categorias: la lista entera
+        # Cuantos canales trae cada una. El panel lo dice en `stream_count` y
+        # es exacto: comprobado contra este servidor, categoria a categoria.
+        # Vale mas que la cache porque llega tambien en el primer arranque,
+        # que es justo cuando cache no hay.
+        tam = {str(c["category_id"]): int(c.get("stream_count") or 0) for c in cats}
+        if not any(tam.values()):
+            tam = self.esperado
+        # Las ocultas al final y la mas gorda primero: es el palo largo de la
+        # carga y todo lo demas cabe a su lado.
+        orden = sorted(ids, key=lambda cid: (cid in self.ocultas,
+                                             -tam.get(cid, 0)))
+
+        sem = threading.Semaphore(self.hilos)
+        hilos = []
+        for cid in orden:
+            h = threading.Thread(target=self._una, args=(cid, sem), daemon=True)
+            h.start()
+            hilos.append(h)
+        limite = getattr(self.cliente, "timeout", 25) + 60
+        for h in hilos:
+            h.join(limite)
+        if self._corta.is_set():
+            return
+        self.cola.put(("fin", {"ok": True, "error": None}))
+
+    def _login_y_categorias(self):
+        """Las dos a la vez: son viajes independientes y cada uno paga su TLS."""
+        cajas = {}
+        for nombre, fn in (("login", self.cliente.login),
+                           ("cats", self.cliente.live_categories)):
+            caja = {}
+
+            def corre(fn=fn, caja=caja):
+                try:
+                    caja["v"] = fn()
+                except Exception as e:
+                    caja["e"] = e
+
+            h = threading.Thread(target=corre, daemon=True)
+            h.start()
+            cajas[nombre] = (h, caja)
+        for h, _ in cajas.values():
+            h.join(getattr(self.cliente, "timeout", 25) + 5)
+        # El login manda: si la cuenta no vale, el otro fallo es consecuencia y
+        # su mensaje solo despistaria.
+        for nombre in ("login", "cats"):
+            _, caja = cajas[nombre]
+            if "e" in caja:
+                raise caja["e"]
+            if "v" not in caja:
+                raise RuntimeError(f"el servidor no respondio a tiempo ({nombre})")
+        return cajas["cats"][1]["v"] or []
+
+    def _sobro(self, cid):
+        """¿Este hilo ya no pinta nada? (cancelado, o el panel no filtra)."""
+        if self._corta.is_set():
+            return True
+        with self._cerrojo:
+            return self._entero is not None and self._entero != cid
+
+    def _una(self, cid, sem):
+        with sem:
+            if self._sobro(cid):
+                return
+            self.cola.put(("empieza", cid))
+            try:
+                completa = self.cliente.live_streams_goteo(
+                    category_id=cid,
+                    on_lote=lambda lote, cid=cid: self._lote(cid, lote),
+                    corta=lambda cid=cid: self._sobro(cid))
+            except Exception as e:
+                if not self._corta.is_set() and not self._sobro(cid):
+                    self.cola.put(("falla", cid, _texto_error(e)))
+                return
+            if not self._corta.is_set():
+                self.cola.put(("lista", cid, completa))
+
+    def _lote(self, cid, lote):
+        if self._corta.is_set():
+            return
+        # Hay paneles que se pasan el category_id por alto y contestan la lista
+        # entera a cualquier peticion. Se detecta en cuanto asoma un canal de
+        # otra categoria, y entonces los demas hilos sobran: esta respuesta ya
+        # lo trae todo. Los canales se guardan siempre por SU category_id, no
+        # por el que se pidio, asi que aunque no se detectara la lista saldria
+        # bien igual; esto solo evita nueve peticiones inutiles de 28 s.
+        if cid is not None and any(str(s.get("category_id")) != str(cid)
+                                   for s in lote):
+            with self._cerrojo:
+                if self._entero is None:
+                    self._entero = cid
+        self.cola.put(("canales", cid, lote))
+
+
 class LiveApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         theme.init()
         self.cfg = load_config()
-        self._rebuild_client()
-        # La lista se pide AQUI, antes de crear un solo widget. Levantar la
-        # ventana de CustomTkinter cuesta un par de segundos; pidiendo ya la
-        # lista, esa espera y la ida y vuelta al servidor se solapan en vez de
-        # sumarse: cuando la ventana esta en pie, la respuesta suele estarlo.
-        if settings.has_credentials(self.cfg):
-            self._prefetch_start()
         self.favorites = set(str(x) for x in self.cfg.get("favorites", []))
         self.fav_groups = self.cfg.get("favorite_groups", [])   # [{name, channels[]}]
         self.hidden = set(str(x) for x in self.cfg.get("hidden_categories", []))
@@ -76,6 +232,7 @@ class LiveApp(ctk.CTk):
         self.all_streams = []
         self.by_id = {}
         self.cat_name = {}
+        self.orden_cat = []           # categorias en el orden que las da el panel
         self.current_list = []
         self.current_stream = None
         self.cat_buttons = []
@@ -84,6 +241,26 @@ class LiveApp(ctk.CTk):
         self._formato_ok = False      # ya se comprobo que el video se ve
         self._loading = False         # hay una recarga de lista en curso
         self._requeue = False         # ...y se pidio otra mientras corria
+        self._descarga = None         # la descarga viva
+        self._token = 0               # cual es: lo de una anterior se ignora
+        self._drenaje = None          # id del after que vacia la cola
+        self._cat_widgets = {}        # cid -> widgets de su fila
+        self._estado_cat = {}         # cid -> pendiente|cargando|lista|falla
+        self._esperado = {}           # cid -> canales que tenia la ultima vez
+        self._llegados = 0            # canales que ya estan en la lista
+        self._latido = 0              # fase del parpadeo de "cargando"
+        self._late_id = None
+        self.fallidas = []            # categorias que no llegaron
+
+        self._rebuild_client()
+        # La lista se pide AQUI, antes de crear un solo widget. Levantar la
+        # ventana de CustomTkinter cuesta cerca de un segundo; pidiendo ya la
+        # lista, esa espera y la ida y vuelta al servidor se solapan en vez de
+        # sumarse. Con la lista partida por categorias eso significa que para
+        # cuando la ventana esta en pie, las categorias pequenas ya han
+        # llegado y hay canales que ensenar desde el primer fotograma.
+        if settings.has_credentials(self.cfg):
+            self._prefetch_start()
         self._fs = False
         self._panels_off = False      # modo solo-reproductor (atajo L)
         self._panels_w = 0            # ancho que ocupaban las dos columnas
@@ -108,14 +285,18 @@ class LiveApp(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build()
         if settings.has_credentials(self.cfg):
-            self.after(0, lambda: self.load(force=False))
+            self.after(0, self.load)
         else:
             self.after(200, lambda: self.open_account(first=True))
 
     def _rebuild_client(self):
-        # Un cambio de cuenta invalida una descarga adelantada en vuelo: sus
-        # datos son de OTRO servidor y no deben acabar pintados ni en la cache.
+        # Un cambio de cuenta invalida una descarga en vuelo: sus datos son de
+        # OTRO servidor y no deben acabar pintados ni en la cache.
+        for viejo in (getattr(self, "_fetch", None), getattr(self, "_descarga", None)):
+            if viejo is not None:
+                viejo.cancela()
         self._fetch = None
+        self._descarga = None
         self.client = XtreamClient(
             self.cfg.get("server", ""), self.cfg.get("username", ""),
             self.cfg.get("password", ""),
@@ -135,7 +316,7 @@ class LiveApp(ctk.CTk):
                 pass
             self._first_load = True
             self._formato_ok = False       # otro servidor, otra comprobacion
-            self.load(force=True)
+            self.load()
         settings.account_dialog(self, self.cfg, on_success, first=first, icon=ICON)
 
     def _apply_icon(self):
@@ -204,7 +385,7 @@ class LiveApp(ctk.CTk):
                                         width=108, height=26, corner_radius=8,
                                         fg_color=C["surface2"], hover_color=C["hover"],
                                         text_color=C["muted"], font=font(11),
-                                        command=lambda: self.load(force=True))
+                                        command=self.load)
         self.reload_btn.pack(side=tk.RIGHT)
 
         # Estado de sincronización de la lista. Existe porque el fallo mas
@@ -215,6 +396,19 @@ class LiveApp(ctk.CTk):
         self.sync_lbl = ctk.CTkLabel(ch_col, text="", text_color=C["muted"],
                                      font=font(10), anchor="w", justify="left")
         self.sync_lbl.pack(anchor="w", padx=18, pady=(0, 6), fill=tk.X)
+
+        # Barra fina de progreso, visible solo mientras la lista esta llegando.
+        # Vive en un hueco fijo bajo la linea de estado, y no empaquetada con
+        # before=self._tw: ahi competiria por el sitio con la barra de
+        # favoritos y el orden acabaria dependiendo de por donde hayas
+        # entrado. Aqui el hueco es siempre el mismo y solo se llena o vacia.
+        self._zona_prog = ctk.CTkFrame(ch_col, fg_color="transparent", height=0)
+        self._zona_prog.pack(fill=tk.X, padx=18)
+        self.prog = ctk.CTkProgressBar(self._zona_prog, height=5, corner_radius=3,
+                                       fg_color=C["surface3"],
+                                       progress_color=C["accent"])
+        self.prog.set(0)
+        self._prog_modo = "determinate"
 
         # barra de favoritos (solo visible en la vista Favoritos)
         self.fav_bar = ctk.CTkFrame(ch_col, fg_color="transparent")
@@ -273,7 +467,7 @@ class LiveApp(ctk.CTk):
 
         self.bind("<F11>", lambda e: self.toggle_fullscreen())
         self.bind("<Escape>", lambda e: self.toggle_fullscreen(False))
-        self.bind("<F5>", lambda e: self.load(force=True))
+        self.bind("<F5>", lambda e: self.load())
         body.bind("<Configure>", self._fit_video, add="+")
         self.after(200, self._fit_video)
         self.after(300, self._hook_resize)
@@ -319,44 +513,46 @@ class LiveApp(ctk.CTk):
                       command=self.play_current).pack(side=tk.LEFT, padx=(8, 14))
 
     # ------------------------------------------------------------------
-    def load(self, force):
-        """Recarga la lista en segundo plano.
+    def load(self):
+        """Vacía la lista y la vuelve a pedir, mostrándola según llega.
 
-        Una sola a la vez: el boton se puede pulsar repetidamente y F5 se
-        repite solo con dejarlo apretado, y dos hilos escribiendo cache.json a
-        la vez es justo lo que no queremos. Lo pedido mientras hay una en curso
-        no se tira, se relanza al terminar: importa al cambiar de cuenta con la
-        carga inicial todavia colgada del timeout del servidor viejo.
+        Ya no se pinta la lista guardada al entrar. Se pintaba para que la
+        ventana no apareciera en blanco durante los 28 s que tardaba la
+        descarga, y como remedio tenía dos caras malas: durante medio minuto
+        estabas mirando canales que podían llevar días sin existir, y no había
+        manera de distinguir «esto es de ayer» de «esto es de ahora». Ahora la
+        lista empieza vacía y se llena de verdad, que se entiende solo.
+
+        Una sola descarga a la vez: el botón se puede pulsar repetidamente y F5
+        se repite con dejarlo apretado. Lo pedido mientras hay una en curso no
+        se tira, se relanza al terminar. Eso importa al cambiar de cuenta con
+        la carga inicial todavía colgada del timeout del servidor viejo.
         """
         if self._loading:
             self._requeue = True
             return
         self._loading = True
+        self._token += 1
         self._reload_ready(False)
 
-        def run():
-            try:
-                self._load(force)
-            finally:
-                self._loading = False
-                self._reload_ready(True)
-                self.after(0, self._drain_requeue)
-
-        threading.Thread(target=run, daemon=True).start()
+        # La descarga adelantada del arranque, si sigue sirviendo. Solo vale si
+        # es de ESTE cliente: un cambio de cuenta la deja inservible.
+        desc, self._fetch = self._fetch, None
+        if desc is None or desc.cliente is not self.client or desc.cancelada:
+            desc = _Descarga(self.client, esperado=self._esperado,
+                             ocultas=self.hidden).arranca()
+        self._descarga = desc
+        self._vacia_lista()
+        self._drena()
 
     def _drain_requeue(self):
-        """Relanza la recarga que se pidio mientras habia otra en curso.
-
-        Corre en el hilo de Tk a proposito: `load` tambien, asi que las dos no
-        pueden entrelazarse y no hay manera de perder una peticion por haber
-        leido `_loading` justo cuando el hilo de trabajo lo estaba bajando.
-        """
+        """Relanza la recarga que se pidió mientras había otra en curso."""
         if self._requeue:
             self._requeue = False
-            self.load(force=True)
+            self.load()
 
     def _reload_ready(self, ready):
-        """Habilita o agrisa el boton de recarga (llamable desde otro hilo)."""
+        """Habilita o agrisa el botón de recarga (llamable desde otro hilo)."""
         def apply():
             btn = getattr(self, "reload_btn", None)
             if btn is None:
@@ -372,7 +568,8 @@ class LiveApp(ctk.CTk):
         try:
             if os.path.exists(CACHE_PATH):
                 try:
-                    ts = json.load(open(CACHE_PATH, encoding="utf-8")).get("fetched_at")
+                    with open(CACHE_PATH, encoding="utf-8-sig") as fh:
+                        ts = json.load(fh).get("fetched_at")
                 except Exception:
                     ts = None
                 ts = ts or os.path.getmtime(CACHE_PATH)
@@ -392,191 +589,697 @@ class LiveApp(ctk.CTk):
     def _sync(self, text, color="muted"):
         self.after(0, lambda: self.sync_lbl.configure(text=text, text_color=C[color]))
 
+    # ---- arranque adelantado -------------------------------------------
     def _prefetch_start(self):
-        """Arranca la descarga de la lista antes de que exista la ventana.
+        """Arranca la descarga antes de que exista la ventana.
 
-        No toca ni un widget (todavia no hay ninguno): deja el resultado en una
-        caja que `_fetch_lists` recoge cuando la interfaz ya esta construida.
+        Levantar la ventana de CustomTkinter cuesta cerca de un segundo;
+        pidiendo ya la lista, esa espera y la ida y vuelta al servidor se
+        solapan en vez de sumarse. Aquí no hay ni un widget que tocar todavía:
+        la descarga escribe en su cola y `load` la recoge cuando la interfaz
+        está en pie.
         """
-        box = {"done": threading.Event(), "data": None, "error": None}
-        self._fetch = box
+        self._esperado = self._esperado_de_cache()
+        self._fetch = _Descarga(self.client, esperado=self._esperado,
+                                ocultas=self.hidden).arranca()
 
-        def run():
-            try:
-                box["data"] = self._download_lists()
-            except Exception as e:               # se reporta al recogerla
-                box["error"] = e
-            finally:
-                box["done"].set()
+    def _esperado_de_cache(self):
+        """Cuántos canales traía cada categoría la última vez.
 
-        threading.Thread(target=run, daemon=True).start()
-
-    def _download_lists(self):
-        """Categorias y canales del servidor. Solo red: no toca la interfaz."""
-        cats, streams = self.client.catalog()
-        if not streams:
-            # Una lista vacia no es una lista: sobrescribir la cache con esto
-            # dejaria al usuario sin canales y sin nada a lo que volver.
-            raise RuntimeError("el servidor devolvió una lista vacía")
-        return cats, streams
-
-    def _fetch_lists(self):
-        """Como `_download_lists`, pero aprovecha la descarga adelantada del
-        arranque si sigue disponible. Se consume: solo sirve una vez.
+        Sirve para dos cosas, y ninguna es pintar canales viejos: saber por
+        cuál empezar —la más gorda primero, que es el palo largo— y poder
+        decir «355 de ~1737» en vez de un número que sube sin que se sepa
+        hacia dónde. Una barra de progreso que no sabe dónde acaba no es una
+        barra de progreso, es un adorno.
         """
-        pending, self._fetch = self._fetch, None
-        if pending is None:
-            return self._download_lists()
-        pending["done"].wait()
-        if pending["error"] is not None:
-            raise pending["error"]
-        return pending["data"]
-
-    def _index_lists(self):
-        self.cat_name = {str(c["category_id"]): c["category_name"]
-                         for c in self.categories}
-        self.by_id = {str(s["stream_id"]): s for s in self.all_streams}
-        by = {}
-        for s in self.all_streams:
-            by.setdefault(str(s.get("category_id")), []).append(s)
-        self.streams_by_cat = by
-        self.after(0, self._populate)
-
-    def _load(self, force):
-        """Pinta la caché al instante y DESPUÉS habla siempre con el servidor.
-
-        Antes, si existía cache.json el programa no volvía a contactar con el
-        servidor nunca más: solo el refresco manual (F5) descargaba. Eso dejaba
-        la lista congelada indefinidamente y, peor todavía, hacía invisible que
-        el servidor hubiera dejado de autorizar la cuenta.
-
-        Ahora se hacen las dos cosas: la caché se muestra de inmediato para que
-        la ventana no se quede en blanco esperando a la red, y la lista se pide
-        siempre. En el arranque ni siquiera se pide aquí: ya venía pedida de
-        antes de construir la ventana (`_prefetch_start`), y `_fetch_lists` se
-        limita a recoger el resultado. Si la descarga falla NO se borra lo que
-        ya había —seguirías pudiendo navegar—, pero el aviso se ve.
-        """
-        served = False              # se ha llegado a pintar la caché al entrar
-        if not force and os.path.exists(CACHE_PATH):
-            try:
-                cache = json.load(open(CACHE_PATH, encoding="utf-8"))
-                self.categories = cache["categories"]
-                self.all_streams = cache["streams"]
-                self._index_lists()
-                served = True
-            except Exception:
-                served = False
-
-        self._sync(f"Lista guardada {self._cache_age()} · actualizando…"
-                   if served else "Descargando lista de canales…")
         try:
-            cats, streams = self._fetch_lists()
-            self.categories, self.all_streams = cats, streams
+            with open(CACHE_PATH, encoding="utf-8-sig") as fh:
+                cache = json.load(fh)
+        except Exception:
+            return {}
+        cuenta = {}
+        for s in cache.get("streams", []):
+            cid = str(s.get("category_id"))
+            cuenta[cid] = cuenta.get(cid, 0) + 1
+        return cuenta
+
+    # ---- la lista creciendo --------------------------------------------
+    def _vacia_lista(self):
+        """Deja la lista en blanco y prepara la ventana para verla crecer."""
+        self.categories = []
+        self.orden_cat = []
+        self.streams_by_cat = {}
+        self.all_streams = []
+        self.by_id = {}
+        self.cat_name = {}
+        self.current_list = []
+        self.fallidas = []
+        self._llegados = 0
+        self._estado_cat = {}
+        self._pinta_categorias([])
+        self._repinta_arbol()
+        self._progreso(0.0)
+        self._sync("Conectando con el servidor…")
+        self._cartel("Conectando con el servidor…",
+                     "Se está pidiendo la lista de canales.")
+        self._arranca_latido()
+
+    def _drena(self):
+        """Vacía la cola de la descarga. Corre SIEMPRE en el hilo de Tk.
+
+        Se vacía entera de una vez y luego se pinta, en vez de pintar por cada
+        evento: la categoría gorda llega en ráfagas de cientos de canales y
+        repintar por cada uno sería tirar el tiempo que se acaba de ganar.
+        """
+        desc = self._descarga
+        if desc is None or desc.cancelada:
+            # La descarga se ha abandonado —cambio de cuenta, o cierre de la
+            # ventana—. De una abandonada no llega ningún «fin», así que el
+            # pestillo hay que soltarlo aquí: si no, `_loading` se queda
+            # puesto, el botón de Actualizar agrisado para siempre y la
+            # recarga que se pidió al cambiar de cuenta no llega a salir.
+            self._drenaje = None
+            self._para_latido()
+            self._progreso(None)
+            self._loading = False
+            self._reload_ready(True)
+            self.after(0, self._drain_requeue)
+            return
+        try:
+            self._drena_una_vez(desc)
+        except Exception as e:
+            # Un fallo pintando no puede dejar la descarga colgada para
+            # siempre, con el boton de recargar agrisado y sin explicacion.
+            # Se termina aqui, se dice, y el usuario puede volver a intentarlo.
+            self._drenaje = None
+            self._para_latido()
+            self._progreso(None)
+            self._loading = False
+            self._reload_ready(True)
+            self._sync(f"⚠  Fallo al pintar la lista · {_texto_error(e)}", "danger")
+
+    def _drena_una_vez(self, desc):
+        nuevos = {}
+        fin = None
+        try:
+            while True:
+                ev = desc.cola.get_nowait()
+                tipo = ev[0]
+                if tipo == "categorias":
+                    self._llegan_categorias(ev[1])
+                elif tipo == "empieza":
+                    self._marca_categoria(ev[1], "cargando")
+                elif tipo == "canales":
+                    nuevos.setdefault(ev[1], []).extend(ev[2])
+                elif tipo == "lista":
+                    nuevos.setdefault(ev[1], []).extend(ev[2])
+                    self._marca_categoria(ev[1], "lista")
+                elif tipo == "falla":
+                    self.fallidas.append((ev[1], ev[2]))
+                    self._marca_categoria(ev[1], "falla")
+                elif tipo == "fin":
+                    fin = ev[1]
+        except queue.Empty:
+            pass
+
+        for cid, lote in nuevos.items():
+            self._mete_canales(cid, lote)
+        if nuevos:
+            self._autoplay()      # una vez, con todo lo del vaciado ya dentro
+        if nuevos or fin:
+            self._actualiza_cuentas()
+        if fin is None:
+            self._sync(self._texto_progreso())
+            self._progreso(self._fraccion())
+            self._drenaje = self.after(70, self._drena)
+        else:
+            self._fin_descarga(fin)
+
+    def _llegan_categorias(self, cats):
+        self.categories = cats
+        self.orden_cat = [str(c["category_id"]) for c in cats]
+        self.cat_name = {str(c["category_id"]): c["category_name"] for c in cats}
+        # El panel dice cuántos canales tiene cada categoría, y es exacto.
+        # Llega a los 0,13 s y existe también en el primer arranque, así que
+        # manda sobre lo que dijera la caché: la barra de progreso sabe dónde
+        # acaba desde el principio, incluso la primera vez que se abre.
+        tam = {str(c["category_id"]): int(c.get("stream_count") or 0) for c in cats}
+        if any(tam.values()):
+            self._esperado = tam
+        for cid in self.orden_cat:
+            self._estado_cat.setdefault(cid, "pendiente")
+        self._pinta_categorias(cats)
+        self._cartel("Pidiendo los canales…",
+                     "Aparecerán aquí conforme vayan llegando, y se pueden usar "
+                     "desde el primero.")
+
+    def _mete_canales(self, cid, lote):
+        """Mete los canales recién llegados SIN repintar la lista entera.
+
+        Repintarla cuesta 12 ms y es tentador por lo simple, pero un repintado
+        borra la selección —y la selección es lo que está sonando— y devuelve
+        el scroll al principio. Con la lista creciendo durante medio minuto,
+        eso sería cortar el canal que estás viendo cada vez que llega un lote.
+
+        Los canales se archivan por SU category_id, no por el que se pidió: si
+        un panel se pasa el filtro por alto y contesta de más, la lista sale
+        bien igual.
+        """
+        porcat = {}
+        for s in lote:
+            sid = str(s.get("stream_id") or "")
+            if not sid or sid in self.by_id:
+                continue
+            self.by_id[sid] = s
+            suya = str(s.get("category_id"))
+            self.streams_by_cat.setdefault(suya, []).append(s)
+            porcat.setdefault(suya, []).append(s)
+        if not porcat:
+            return
+        self._llegados = len(self.by_id)
+        self._reordena()
+        for real, grupo in porcat.items():
+            self._inserta_en_arbol(real, grupo)
+        # La sonda de vídeo, en cuanto hay un canal que sondear. Antes esperaba
+        # a la lista entera, o sea 28 s para enterarse de que no se ve nada.
+        if not self._formato_ok and self.all_streams:
+            self._formato_ok = True
+            primero = self.all_streams[0]
+            threading.Thread(target=self._verificar_formato,
+                             args=(primero, self._token), daemon=True).start()
+
+    def _reordena(self):
+        """Rehace la lista global en el orden en que el panel da las categorías.
+
+        Las categorías llegan cuando les toca —la pequeña a los 0,13 s y la
+        gorda a los 27—, pero la lista tiene que verse siempre igual: el orden
+        lo manda el panel, no quién gane la carrera. Rehacerla cuesta un
+        milisegundo sobre 1737 canales.
+        """
+        orden = list(self.orden_cat)
+        for cid in self.streams_by_cat:
+            if cid not in orden:
+                orden.append(cid)
+        self.orden_cat = orden
+        self.all_streams = [s for cid in orden
+                            for s in self.streams_by_cat.get(cid, [])]
+
+    def _hueco(self, cid):
+        """En qué fila de la vista «Todos» empieza el bloque de una categoría."""
+        n = 0
+        for c in self.orden_cat:
+            if c == cid:
+                break
+            if c in self.hidden:
+                continue
+            n += len(self.streams_by_cat.get(c, []))
+        return n
+
+    def _inserta_en_arbol(self, cid, grupo):
+        if not hasattr(self, "tree"):
+            return
+        # La lista de la vista se mantiene al día SIEMPRE, se pinte o no: de
+        # ella salen el buscador, la exportación a M3U y el contador. Cuando
+        # esto se hacía solo en la rama que pinta, con el buscador escrito la
+        # lista dejaba de crecer por dentro y lo que llegaba se perdía.
+        if self.cat_key == "all":
+            self.current_list = self._visible_streams()
+        elif self.cat_key == cid:
+            self.current_list = list(self.streams_by_cat.get(cid, []))
+
+        if self.cat_key == "fav":
+            self._repinta_arbol()          # los favoritos van agrupados aparte
+            return
+        if self.cat_key == "all" and cid in self.hidden:
+            return                         # categoría oculta: solo cuenta
+        if self.cat_key not in ("all", cid):
+            return                         # no se está mirando: solo cuenta
+        if self.search_var.get().strip():
+            self._repinta_arbol()          # con filtro puesto, más vale rehacer
+            return
+        base = 0 if self.cat_key == cid else self._hueco(cid)
+        ya = len(self.streams_by_cat.get(cid, [])) - len(grupo)
+        for k, s in enumerate(grupo):
+            fav = str(s["stream_id"]) in self.favorites
+            self.tree.insert("", base + ya + k, iid=str(s["stream_id"]),
+                             text="  " + s.get("name", ""),
+                             image=(self.img_on if fav else self.img_off))
+        self._cartel(None)
+
+    def _refresca_vista(self):
+        """Rehace `current_list` desde cero para la vista que esté puesta.
+
+        La lista de la vista se va manteniendo al día lote a lote, que es lo
+        rápido; esto es el cinturón: al acabar la carga se recalcula entera,
+        para que el estado en que queda la ventana no dependa del camino que
+        haya seguido la descarga.
+        """
+        if self.cat_key == "all":
+            self.current_list = self._visible_streams()
+        elif self.cat_key != "fav":
+            self.current_list = list(self.streams_by_cat.get(self.cat_key, []))
+
+    def _repinta_arbol(self):
+        """Repinta la lista conservando la selección y el sitio del scroll.
+
+        Devolver la selección vuelve a disparar <<TreeviewSelect>>, o sea que
+        `on_channel` se ejecuta otra vez con el canal que ya estaba sonando.
+        Lo que evita que se corte y se reanude no es una bandera —Tk entrega
+        ese evento ANTES de que corra un `after_idle`, así que una bandera que
+        se apaga al quedar libre llega tarde y encima se traga el arranque
+        automático—, sino que `on_channel` mire si el canal es el mismo.
+        """
+        if not hasattr(self, "tree"):
+            return
+        sel = list(self.tree.selection())
+        arriba = self.tree.yview()[0]
+        self.apply_filter()
+        quedan = [i for i in sel if self.tree.exists(i)]
+        if quedan:
+            self.tree.selection_set(quedan)
+        self.tree.yview_moveto(arriba)
+
+    def _autoplay(self):
+        """Arranca el primer canal, pero solo cuando ya es EL primero.
+
+        Con la lista creciendo por trozos, el primero de la lista cambia
+        conforme llegan categorías que van por delante. Reproducir el primero
+        que aparezca sería reproducir el que gane la carrera, que es distinto
+        cada arranque. Se espera a que la primera categoría visible esté
+        entera: contra este panel es MOVISTAR ESPAÑA y llega a los 0,13 s, o
+        sea que la espera no se nota. Antes esto pasaba a los 28 s.
+        """
+        if not self._first_load or not self.orden_cat:
+            return
+        primera = next((c for c in self.orden_cat if c not in self.hidden), None)
+        if primera is None or self._estado_cat.get(primera) != "lista":
+            return
+        # El primer canal DE ESA categoría, y no la primera fila del árbol.
+        # Parecen lo mismo y no lo son: en el mismo vaciado de la cola pueden
+        # llegar dos categorías, y si la que va detrás se mete en el árbol
+        # antes, la primera fila todavía es suya. Contra el servidor real eso
+        # se veía en que el canal que arrancaba solo cambiaba en cada
+        # ejecución: unas veces Movistar, otras la NBA.
+        primeros = self.streams_by_cat.get(primera) or []
+        if not primeros:
+            return
+        iid = str(primeros[0].get("stream_id"))
+        if not self.tree.exists(iid):
+            return
+        self._first_load = False
+        self.tree.selection_set(iid)
+        self.tree.see(iid)
+
+    # ---- final de la descarga -------------------------------------------
+    def _fin_descarga(self, info):
+        self._drenaje = None
+        self._para_latido()
+        self._progreso(None)
+        self._loading = False
+        self._reload_ready(True)
+        n = len(self.by_id)
+        # Un repintado final, siempre. Durante la carga las filas se meten en
+        # su hueco, que es un SEGUNDO cálculo del mismo orden que hace
+        # `_reordena`. Este repintado cuadra los dos y cierra la posibilidad de
+        # que hayan divergido sin que nadie se entere. Cuesta 12 ms, una vez.
+        if n:
+            self._refresca_vista()
+            self._repinta_arbol()
+
+        if not info.get("ok") and not n:
+            motivo = info.get("error") or "el servidor no ha contestado"
+            self._sync(f"⚠  Sin lista de canales · {motivo}", "danger")
+            acciones = [("Reintentar", self.load)]
+            if os.path.exists(CACHE_PATH):
+                acciones.append((f"Usar la lista guardada ({self._cache_age()})",
+                                 self._usa_cache))
+            self._cartel("No se ha podido cargar la lista", motivo, acciones,
+                         color=C["danger"])
+        elif self.fallidas:
+            cuales = ", ".join(self.cat_name.get(c, c) for c, _ in self.fallidas)
+            self._sync(f"⚠  Lista incompleta · {n} canales · falló {cuales}", "warn")
+        elif not n:
+            self._sync("⚠  El servidor ha devuelto una lista vacía", "danger")
+            self._cartel("El servidor no ha dado ni un canal",
+                         "La cuenta conecta, pero la lista viene vacía.",
+                         [("Reintentar", self.load)], color=C["danger"])
+        else:
+            faltan = self._faltan_canales()
+            if faltan:
+                # Nada de fallar en silencio. Pidiendo por categorías, un canal
+                # que esté en una categoría que el panel no lista no se pide
+                # nunca y desaparecería sin un solo aviso: el peor fallo
+                # posible en este programa, porque parece que todo va bien.
+                self._sync(f"⚠  Lista actualizada · {n} canales · faltan "
+                           f"{faltan} que el panel dice tener", "warn")
+            else:
+                self._sync(f"Lista actualizada · {n} canales", "ok")
+            self._guarda_cache()
+        self.after(0, self._drain_requeue)
+
+    def _faltan_canales(self):
+        """Cuántos canales dice el panel que tiene y no han llegado."""
+        dice = sum(int(c.get("stream_count") or 0) for c in self.categories)
+        return max(0, dice - len(self.by_id)) if dice else 0
+
+    def _guarda_cache(self):
+        """Guarda la lista para el próximo arranque.
+
+        Ya no se pinta al entrar, pero sigue haciendo falta: de ella salen las
+        cuentas por categoría que hacen honesta la barra de progreso, y es lo
+        único que queda si mañana el servidor no contesta. Solo se guarda
+        cuando la descarga ha venido completa: media lista guardada como si
+        fuera entera es una trampa que se descubre tarde.
+        """
+        if self.fallidas or not self.by_id:
+            return
+        try:
             tmp = CACHE_PATH + ".tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump({"fetched_at": time.time(), "categories": cats,
-                           "streams": streams}, fh, ensure_ascii=False)
+                json.dump({"fetched_at": time.time(),
+                           "categories": self.categories,
+                           "streams": self.all_streams}, fh, ensure_ascii=False)
             os.replace(tmp, CACHE_PATH)
-            self._index_lists()
-            self._sync(f"Lista actualizada · {len(streams)} canales", "ok")
-            self._verificar_formato(streams)
-        except Exception as e:
-            msg = (str(e).strip() or type(e).__name__)[:90]
-            if self.all_streams:
-                # Hay lista utilizable en pantalla: no molestamos con un
-                # diálogo, pero que quede claro que puede estar caducada.
-                #
-                # La condición es «hay canales», no «acabo de pintar la
-                # caché». Con el botón de Actualizar el usuario provoca
-                # recargas forzadas a media sesión, que no pasan por la
-                # caché; mirando lo segundo, un servidor que fallara justo
-                # al pulsarlo anunciaba «Sin lista de canales» y sacaba un
-                # diálogo de error con los canales ahí delante, intactos.
-                self._sync(f"⚠  No se pudo actualizar · lista {self._cache_age()} · {msg}",
-                           "danger")
-            else:
-                self._sync(f"⚠  Sin lista de canales · {msg}", "danger")
-                self.after(0, lambda: messagebox.showerror(
-                    "Error de conexión", f"No se pudo cargar la lista.\n\n{msg}"))
+        except Exception:
+            pass          # no poder guardar la caché no estropea la sesión
 
-    def _verificar_formato(self, streams):
-        """Comprueba que los canales se pueden ver, no solo listar.
+    def _usa_cache(self):
+        """Pinta la lista guardada. SOLO si el usuario lo pide expresamente."""
+        try:
+            with open(CACHE_PATH, encoding="utf-8-sig") as fh:
+                cache = json.load(fh)
+            cats = cache.get("categories", [])
+            streams = cache.get("streams", [])
+        except Exception as e:
+            self._sync(f"⚠  La lista guardada no se puede leer · {_texto_error(e)}",
+                       "danger")
+            return
+        edad = self._cache_age()
+        self.categories = cats
+        self.orden_cat = [str(c["category_id"]) for c in cats]
+        self.cat_name = {str(c["category_id"]): c["category_name"] for c in cats}
+        self.streams_by_cat = {}
+        self.by_id = {}
+        for s in streams:
+            sid = str(s.get("stream_id") or "")
+            if not sid or sid in self.by_id:
+                continue
+            self.by_id[sid] = s
+            self.streams_by_cat.setdefault(str(s.get("category_id")), []).append(s)
+        self._reordena()
+        self._llegados = len(self.by_id)
+        self._estado_cat = {cid: "lista" for cid in self.orden_cat}
+        self._pinta_categorias(cats)
+        self._cartel(None)
+        # select_key y no _repinta_arbol a secas: hay que rehacer current_list,
+        # que es de donde apply_filter saca las filas.
+        self.select_key(self.cat_key if self.cat_key in self._cat_widgets else "all")
+        self._actualiza_cuentas()
+        self._sync(f"⚠  Lista guardada {edad} · el servidor no ha contestado",
+                   "warn")
+
+    def _verificar_formato(self, stream, token):
+        """Comprueba que los canales se pueden VER, no solo listar.
 
         Listar y reproducir van por caminos distintos: la lista puede llegar
-        perfecta y el video estar cortado. Pasa cuando el panel esta detras de
-        un CDN —Cloudflare no permite repartir television por su red— que deja
-        pasar la API y corta el flujo de video, redirigiendolo a un dominio que
-        resuelve a 127.0.0.1. El sintoma es demoledor por lo mudo que es:
-        estan los 1737 canales en su sitio y ninguno arranca.
+        perfecta y el vídeo estar cortado. Pasa cuando el panel está detrás de
+        un CDN —Cloudflare no permite repartir televisión por su red— que deja
+        pasar la API y corta el flujo de vídeo, redirigiéndolo a un dominio que
+        resuelve a 127.0.0.1. El síntoma es demoledor por lo mudo que es:
+        están los 1737 canales en su sitio y ninguno arranca.
 
-        Se prueba UNA vez por sesion, ya con la lista pintada, y si el formato
-        configurado no sirve pero otro si, se cambia y se recuerda.
+        Corre en su propio hilo, en cuanto hay UN canal que sondear.
         """
-        if self._formato_ok or not streams:
-            return
-        self._formato_ok = True                  # una sola vez, salga lo que salga
         actual = self.cfg.get("output") or SALIDA_POR_DEFECTO
         try:
-            ext, motivo = self.client.formato_que_funciona(streams[0]["stream_id"])
+            ext, motivo = self.client.formato_que_funciona(stream["stream_id"])
         except Exception:
             return                               # una sonda que falla no molesta
+        if token != self._token:
+            return                               # es de una carga ya superada
         if ext is None:
             self._sync(f"⚠  La lista carga pero el vídeo no: {motivo}", "danger")
             return
         if ext != actual:
-            self.cfg["output"] = ext
-            try:
-                save_config(self.cfg)
-            except Exception:
-                pass
-            self._rebuild_client()
-            self._sync(f"Lista actualizada · {len(streams)} canales "
-                       f"· vídeo por {ext.upper()}", "ok")
+            self.after(0, lambda e=ext: self._aplica_formato(e))
+
+    def _aplica_formato(self, ext):
+        """Cambia el formato de vídeo, ya en el hilo de Tk.
+
+        Lo decide la sonda, que corre en su propio hilo, pero `self.cfg` es de
+        la ventana: escribirlo desde fuera podría pisarse con el guardado que
+        hace `_on_close` al cerrar. El hilo solo trae la respuesta; el cambio
+        se aplica aquí.
+        """
+        self.cfg["output"] = ext
+        # Se toca solo la salida y no se rehace el cliente: rehacerlo
+        # cancelaría la descarga que en este momento puede seguir en marcha.
+        self.client.output = ext
+        try:
+            save_config(self.cfg)
+        except Exception:
+            pass
+        self._sync(f"Vídeo por {ext.upper()} · {len(self.by_id)} canales", "ok")
+
+    # ---- indicadores ------------------------------------------------------
+    def _fraccion(self):
+        # Si ya han contestado todas, la barra esta llena: da igual lo que
+        # dijera el `stream_count`. Hay paneles que exageran, y un medidor
+        # clavado al 90 % con la lista entera delante no se lo cree nadie.
+        if self.orden_cat and all(self._estado_cat.get(c) in ("lista", "falla")
+                                  for c in self.orden_cat):
+            return 1.0
+        total = sum(self._esperado.values())
+        if not total:
+            return None                          # sin datos no se sabe el final
+        return min(1.0, self._llegados / float(total))
+
+    def _texto_progreso(self):
+        total = sum(self._esperado.values())
+        n = self._llegados
+        txt = f"Cargando la lista…  {n}"
+        if total and n <= total:
+            txt += f" de ~{total}"
+        txt += " canales"
+        if self.orden_cat:
+            hechas = sum(1 for c in self.orden_cat
+                         if self._estado_cat.get(c) in ("lista", "falla"))
+            txt += f"  ·  {hechas} de {len(self.orden_cat)} categorías"
+            faltan = [self.cat_name.get(c, c) for c in self.orden_cat
+                      if self._estado_cat.get(c) not in ("lista", "falla")]
+            if 0 < len(faltan) <= 2:
+                txt += "  ·  falta " + " y ".join(faltan)
+        return txt
+
+    def _progreso(self, frac=0.0):
+        """La barra fina sobre la lista. `frac=None` la retira."""
+        barra = getattr(self, "prog", None)
+        if barra is None:
+            return
+        if frac is None:
+            if barra.winfo_ismapped():
+                barra.stop()
+                barra.pack_forget()
+            return
+        if not barra.winfo_ismapped():
+            barra.pack(fill=tk.X, pady=(2, 8))
+        f = self._fraccion()
+        if f is None:
+            # Primer arranque: no hay caché, o sea que no se sabe cuántos
+            # canales van a venir. Una barra que se inventa el final miente;
+            # esta solo dice «esto sigue vivo».
+            if self._prog_modo != "indeterminate":
+                self._prog_modo = "indeterminate"
+                barra.configure(mode="indeterminate")
+                barra.start()
+        else:
+            if self._prog_modo != "determinate":
+                self._prog_modo = "determinate"
+                barra.stop()
+                barra.configure(mode="determinate")
+            barra.set(f)
+
+    def _arranca_latido(self):
+        if self._late_id is None:
+            self._late()
+
+    def _para_latido(self):
+        if self._late_id is not None:
+            self.after_cancel(self._late_id)
+            self._late_id = None
+        for cid in list(self._cat_widgets):
+            if self._estado_cat.get(cid) == "cargando":
+                self._estado_cat[cid] = ("lista" if self.streams_by_cat.get(cid)
+                                         else "falla")
+            self._pinta_fila_categoria(cid)
+
+    def _late(self):
+        """Latido de la barrita de color de las categorías que aún llegan.
+
+        Un solo temporizador para todas: así laten a la vez y parece
+        intencionado, en vez de un baile de luces descoordinado.
+        """
+        self._latido = (self._latido + 1) % 16
+        t = self._latido / 8.0
+        if t > 1.0:
+            t = 2.0 - t
+        for cid, w in self._cat_widgets.items():
+            if self._estado_cat.get(cid) != "cargando":
+                continue
+            if self.streams_by_cat.get(cid):
+                continue        # ya tiene medidor que mirar: no hace falta latir
+            w["bar"].configure(bg=theme.mezcla(C["surface"], w["color"],
+                                               0.15 + 0.5 * t))
+        self._late_id = self.after(80, self._late)
 
     def _visible_streams(self):
         return [s for s in self.all_streams
                 if str(s.get("category_id")) not in self.hidden]
 
-    def _populate(self):
-        self._build_category_buttons()
-        self.select_key("all")
-        if self._first_load:
-            self._first_load = False
-            kids = self.tree.get_children()
-            if kids:
-                self.tree.selection_set(kids[0])
-                self.tree.see(kids[0])
+    # ---- columna de categorías -------------------------------------------
+    PALETA = ["#0a84ff", "#2dd4bf", "#bf5af2", "#ff9f0a", "#30d158",
+              "#ff6482", "#64d2ff", "#ff453a", "#5e5ce6", "#ffd60a", "#34c759"]
 
-    def _build_category_buttons(self):
-        for _, b, row in self.cat_buttons:
-            row.destroy()
+    def _pinta_categorias(self, cats):
+        """Construye la columna de categorías. Se hace UNA vez por descarga.
+
+        A partir de aquí las filas no se vuelven a crear, solo se les cambia
+        el texto y el color de la barrita: crear widgets de CustomTkinter en
+        cada lote que llega se vería como un parpadeo, y son veinticuatro
+        lotes en una carga.
+        """
+        if not hasattr(self, "cat_holder"):
+            return
+        for w in self._cat_widgets.values():
+            w["row"].destroy()
+        self._cat_widgets = {}
         self.cat_buttons = []
-        palette = ["#0a84ff", "#2dd4bf", "#bf5af2", "#ff9f0a", "#30d158",
-                   "#ff6482", "#64d2ff", "#ff453a", "#5e5ce6", "#ffd60a", "#34c759"]
-        entries = [("fav", f"★  Favoritos ({len(self.favorites)})", C["gold"]),
-                   ("all", f"Todos ({len(self._visible_streams())})", "#c7c7cf")]
+        filas = [("fav", "★  Favoritos", C["gold"]),
+                 ("all", "Todos", "#c7c7cf")]
         ci = 0
-        for c in self.categories:
+        for c in cats:
             cid = str(c["category_id"])
             if cid in self.hidden:
                 continue
-            n = len(self.streams_by_cat.get(cid, []))
-            color = palette[ci % len(palette)]
+            filas.append((cid, c["category_name"], self.PALETA[ci % len(self.PALETA)]))
             ci += 1
-            entries.append((cid, f'{c["category_name"]}  ·  {n}', color))
-        for key, text, color in entries:
+        for key, nombre, color in filas:
             row = ctk.CTkFrame(self.cat_holder, fg_color="transparent", height=34)
             row.pack(fill=tk.X, pady=1)
             row.pack_propagate(False)
-            tk.Frame(row, width=4, bg=color, highlightthickness=0, bd=0).pack(
-                side=tk.LEFT, fill=tk.Y, padx=(4, 6), pady=6)
-            b = ctk.CTkButton(row, text=text, anchor="w", height=32,
+            # La barrita de color de la izquierda hace de medidor: el fondo es
+            # el color apagado y el relleno sube desde abajo según van
+            # llegando los canales de esa categoría. Diez medidores llenándose
+            # a distinta velocidad se leen de un vistazo, sin números.
+            bar = tk.Frame(row, width=4, bg=theme.mezcla(C["surface"], color, 0.22),
+                           highlightthickness=0, bd=0)
+            bar.pack(side=tk.LEFT, fill=tk.Y, padx=(4, 6), pady=6)
+            bar.pack_propagate(False)
+            relleno = tk.Frame(bar, bg=color, highlightthickness=0, bd=0)
+            relleno.place(relx=0, rely=1.0, relwidth=1.0, relheight=1.0,
+                          anchor="sw")
+            b = ctk.CTkButton(row, text=nombre, anchor="w", height=32,
                               corner_radius=8, fg_color="transparent",
                               hover_color=C["hover"], text_color=C["muted"],
                               font=font(12), command=lambda k=key: self.select_key(k))
             b.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            b.configure(fg_color=C["accent"] if key == self.cat_key else "transparent",
+                        text_color="#ffffff" if key == self.cat_key else C["muted"])
+            self._cat_widgets[key] = {"row": row, "btn": b, "bar": bar,
+                                      "relleno": relleno, "color": color,
+                                      "nombre": nombre}
             self.cat_buttons.append((key, b, row))
+        self._actualiza_cuentas()
+
+    def _marca_categoria(self, cid, estado):
+        if cid is None:
+            return                    # panel sin categorias: no hay fila que pintar
+        cid = str(cid)
+        self._estado_cat[cid] = estado
+        self._pinta_fila_categoria(cid)
+
+    def _pinta_fila_categoria(self, cid):
+        """Pone al día una fila: cuántos canales tiene y en qué estado está.
+
+        Los cuatro estados se distinguen sin leer, por la barrita de color de
+        la izquierda: apagada = todavía no ha llegado, latiendo = está
+        llegando, encendida = completa, roja = no vino.
+        """
+        w = self._cat_widgets.get(cid)
+        if not w or cid in ("fav", "all"):
+            return
+        estado = self._estado_cat.get(cid, "pendiente")
+        n = len(self.streams_by_cat.get(cid, []))
+        espera = self._esperado.get(cid, 0)
+        nombre = w["nombre"]
+        lleno = 1.0
+        if estado == "lista":
+            texto, color = f"{nombre}  ·  {n}", C["muted"]
+            w["relleno"].configure(bg=w["color"])
+        elif estado == "falla":
+            texto, color = f"{nombre}  ·  no cargó", C["danger"]
+            w["relleno"].configure(bg=C["danger"])
+        elif estado == "cargando":
+            texto = f"{nombre}  ·  {n} de ~{espera}" if espera else f"{nombre}  ·  {n}…"
+            color = C["text"]
+            lleno = min(1.0, n / float(espera)) if espera else (0.06 if not n else 0.5)
+            w["relleno"].configure(bg=w["color"])
+        else:
+            texto = f"{nombre}  ·  ~{espera}" if espera else f"{nombre}  ·  …"
+            color = C["faint"]
+            lleno = 0.0
+        w["relleno"].place_configure(relheight=lleno)
+        if not (estado == "cargando" and not n):
+            # el fondo vuelve a su color apagado; solo late mientras se espera
+            # el primer canal de esa categoria, que es cuando no hay medidor
+            w["bar"].configure(bg=theme.mezcla(C["surface"], w["color"], 0.22))
+        w["btn"].configure(text=texto,
+                           text_color="#ffffff" if self.cat_key == cid else color)
+
+    def _actualiza_cuentas(self):
+        """Los números que cambian mientras la lista crece."""
+        w = self._cat_widgets.get("fav")
+        if w:
+            w["btn"].configure(text=f"★  Favoritos ({len(self.favorites)})")
+        w = self._cat_widgets.get("all")
+        if w:
+            w["btn"].configure(text=f"Todos ({len(self._visible_streams())})")
+        for cid in list(self._cat_widgets):
+            self._pinta_fila_categoria(cid)
+        if hasattr(self, "count_lbl") and self.cat_key != "fav":
+            self.count_lbl.configure(
+                text=f"CANALES · {len(self.tree.get_children())}",
+                text_color=C["faint"])
+
+    def _cartel(self, titulo=None, detalle=None, acciones=(), color=None):
+        """Cartel centrado sobre la lista vacía. Con `titulo=None` se quita.
+
+        Una lista vacía sin explicación es indistinguible de un programa roto,
+        y es justo lo primero que ve el usuario al arrancar. Este cartel es lo
+        que convierte «no hay nada» en «viene de camino».
+        """
+        viejo = getattr(self, "_cartel_w", None)
+        if viejo is not None:
+            viejo.destroy()
+            self._cartel_w = None
+        if not titulo or not hasattr(self, "_tw"):
+            return
+        caja = ctk.CTkFrame(self._tw, fg_color="transparent")
+        ctk.CTkLabel(caja, text=titulo, text_color=color or C["muted"],
+                     font=font(13, "bold"), justify="center").pack()
+        if detalle:
+            ctk.CTkLabel(caja, text=detalle, text_color=C["faint"], font=font(11),
+                         justify="center", wraplength=260).pack(pady=(6, 0))
+        if acciones:
+            fila = ctk.CTkFrame(caja, fg_color="transparent")
+            fila.pack(pady=(14, 0))
+            for texto, cmd in acciones:
+                ctk.CTkButton(fila, text=texto, height=30, corner_radius=8,
+                              fg_color=C["surface2"], hover_color=C["hover"],
+                              text_color=C["text"], font=font(11),
+                              command=cmd).pack(side=tk.LEFT, padx=4)
+        caja.place(relx=0.5, rely=0.40, anchor="center")
+        self._cartel_w = caja
 
     # ------------------------------------------------------------------
     def select_key(self, key):
@@ -908,7 +1611,19 @@ class LiveApp(ctk.CTk):
         s = self.by_id.get(sel[0])
         if not s:
             return
+        # Ya está sonando: no se reinicia. Sin esto, cualquier repintado de la
+        # lista —y durante la carga hay unos cuantos— cortaría el canal medio
+        # segundo para volver a ponerlo.
+        actual = self.current_stream
+        if actual is not None and str(actual.get("stream_id")) == str(s.get("stream_id")):
+            self.current_stream = s
+            return
         self.current_stream = s
+        # El usuario ha elegido: el arranque automático ya no pinta nada. Sin
+        # esto, con la lista todavía creciendo, elegir un canal a los 0,6 s y
+        # que luego llegara una categoría que va por delante hacía que el
+        # arranque automático saltara encima y te cambiara de canal solo.
+        self._first_load = False
         self.player.enable_actions(str(s.get("tv_archive")) == "1")
         self.play_current()
         self.player.set_epg("cargando guía…")
@@ -961,7 +1676,7 @@ class LiveApp(ctk.CTk):
             self.cfg["hidden_categories"] = sorted(self.hidden)
             save_config(self.cfg)
             win.destroy()
-            self._build_category_buttons()
+            self._pinta_categorias(self.categories)
             self.select_key("all" if self.cat_key in self.hidden else self.cat_key)
 
         ctk.CTkButton(win, text="Guardar", height=38, corner_radius=10,
@@ -1319,6 +2034,14 @@ class LiveApp(ctk.CTk):
 
     def _on_close(self):
         self._unhook_resize()
+        for viva in (self._fetch, self._descarga):
+            if viva is not None:
+                viva.cancela()
+        if self._drenaje is not None:
+            try:
+                self.after_cancel(self._drenaje)
+            except Exception:
+                pass
         try:
             if not self._fs and self.state() == "normal":
                 self.cfg["window_geometry"] = self._restored_geometry()

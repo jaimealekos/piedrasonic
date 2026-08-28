@@ -98,34 +98,74 @@ vídeo pero el otro sí, se cambia solo y se recuerda. Las redirecciones se sigu
 a mano en esa sonda **a propósito**: siguiéndolas sin mirar, el corte del CDN
 llega disfrazado de error de red y parece cosa del PC del usuario.
 
-**4. La lista tiene que refrescarse en cada arranque.** Hubo una versión en la
-que, si existía `cache.json`, el programa no volvía a contactar con el servidor
-**nunca**. La interfaz enseñaba la lista vieja y todo parecía normal hasta
-pulsar un canal. Ahora la caché se pinta al instante y la descarga ocurre en
-segundo plano siempre, con un aviso permanente bajo el buscador que dice de
-cuándo es la lista.
+**4. La lista se pide entera en cada arranque, y se enseña según llega.** Hubo
+una versión en la que, si existía `cache.json`, el programa no volvía a
+contactar con el servidor **nunca**: enseñaba la lista vieja y todo parecía
+normal hasta pulsar un canal. Se arregló pintando la caché al instante y
+descargando por detrás, pero eso tenía su propia cara mala —durante medio
+minuto estabas mirando canales que podían llevar días sin existir—. Desde el 28
+de agosto de 2026 **la lista empieza vacía y se llena de verdad**: ver el punto
+5, que es donde está el detalle.
 
-## 5. Rendimiento: lo que ya está medido
+## 5. La carga de la lista: cómo funciona y por qué
 
-No repitas estas pruebas, ya están hechas. Actualizar la lista tarda unos **28
-segundos** y **27,8 de esos 28 son una sola llamada**, `get_live_streams`, y
-dentro de ella una sola categoría, «Latinos», que trae 1382 de los 1737 canales.
-Las otras nueve responden en 0,33-0,38 s cada una.
+Actualizar la lista tarda **28 segundos** contra este servidor, y no hay manera
+de que tarde menos: `get_live_streams` son 27,6 de esos 28, y dentro de ella
+**una sola categoría**, «Latinos», que trae 1382 de los 1737 canales. Las otras
+nueve contestan en **0,13-0,16 s cada una**.
 
-Descartado por medición, no por intuición:
+Lo importante es la distinción que costó ver: **el total no baja, pero la
+espera sí**. Pidiendo la lista por categorías en paralelo el total sigue siendo
+28 s, y a los **0,42 s** hay ya 355 canales en pantalla y funcionando. Y la
+categoría gorda tampoco llega de golpe: el panel manda la respuesta con
+`Transfer-Encoding: chunked` según la genera —primer byte a los 7,4 s, último a
+los 27,7—, así que leyéndola a trozos aparecen varios cientos de canales más a
+mitad de camino en vez de nada hasta el final.
+
+Medido en la aplicación entera, con el servidor real:
+
+| Momento | Antes | Ahora |
+|---|---|---|
+| Ventana con canales | 28 s | **0,6 s** (321 canales) |
+| Primer canal sonando | 28 s | **0,5 s** |
+| Mitad de la lista | 28 s | 8,4 s (865 canales) |
+| Lista completa | 28 s | 28 s |
+
+Cómo está hecho: `xtream.live_streams_goteo()` lee la respuesta a trozos y va
+entregando canales según se completan —y al terminar parsea el cuerpo entero de
+una pieza, que es el resultado bueno: el goteo es solo un adelanto para poder
+pintar—. La clase `_Descarga` de `iptv_player.pyw` lanza una petición por
+categoría (seis a la vez, la más gorda primero) y **lo deja todo en una cola**;
+la ventana la vacía cada 70 ms desde su propio hilo. Ni un widget se toca desde
+un hilo que no sea el de Tk, y la cola es la única puerta.
+
+Lo que ve el usuario, y por qué así:
+
+- **Barra de progreso** sobre la lista, con el final bien puesto: el panel dice
+  cuántos canales tiene cada categoría en `stream_count`, y es exacto. Por eso
+  se puede decir «355 de ~1737» desde el primer arranque, sin caché.
+- **Cada categoría es su propio medidor.** La barrita de color de la izquierda
+  se llena de abajo arriba según llegan sus canales. Apagada = no ha empezado;
+  latiendo = pedida y esperando el primer canal; llenándose = está llegando;
+  entera = completa; roja = no vino. Diez medidores se leen de un vistazo, sin
+  números.
+- **Un cartel en la lista vacía** mientras no hay nada. Una lista vacía sin
+  explicación es indistinguible de un programa roto, y es lo primero que se ve.
+- **Todo lo que aparece se puede usar ya**: pinchar un canal, buscar, marcar
+  favoritos. Y lo que elija el usuario manda sobre el arranque automático.
+
+Descartado por medición, no por intuición (no repitas estas pruebas):
 
 - **Comprimir con gzip** baja la lista de 522 kB a 48 kB y no quita ni un
-  segundo (27,78 s con gzip, 27,91 s sin él). Se ha dejado puesto porque en una
-  conexión lenta sí ayudaría, pero aquí el cuello de botella es lo que tarda el
-  panel en generar la respuesta, no la transferencia.
-- **Partir la petición por categorías** y lanzarlas a la vez no arregla nada:
-  esa categoría sigue tardando lo mismo.
+  segundo (27,78 s con gzip, 27,91 s sin él). Se queda puesto porque en una
+  conexión lenta ayudaría, y porque el goteo funciona igual con él.
+- **Partir la petición por categorías no baja el total.** Cierto, y sigue
+  siéndolo: se hace por lo otro, por el tiempo hasta el primer canal.
 - **Pintar la interfaz** no es el problema: meter los 1737 canales en la tabla
   cuesta 12 ms e indexarlos 1 ms.
-- **Lanzar login, categorías y canales a la vez** sí ayudó, pero poco: 0,6 s de
-  28,4.
-
-Sigue abierto. Cualquier arreglo tiene que atacar esa categoría concreta.
+- **`limit` y `offset`** en `get_live_streams`: el panel los acepta y los
+  ignora, devuelve los 1382 igual.
+- **Lanzar login, categorías y canales a la vez** ayudó poco: 0,6 s de 28,4.
 
 ## 6. Cómo se compila y se publica
 
@@ -153,20 +193,16 @@ README le dice al usuario que descargue.
 
 ## 7. Dónde estamos ahora mismo
 
-Rama de trabajo: **`fix/vlc-bundle-and-playlist-refresh`**, con **4 commits sin
-empujar**. La PR #1 está abierta pero solo enseña el primero de los cinco.
+Rama de trabajo: **`fix/vlc-bundle-and-playlist-refresh`**, empujada y al día
+con la PR #1.
 
-Tres cosas pendientes, por orden de urgencia:
-
-1. **Empujar los cuatro commits.** La PR muestra el trabajo de hace seis días.
-2. **La release v1.3.0 está coja.** Su compilación automática falló (el servidor
-   de GitHub no tenía VLC y el `.spec` abortó, que es justo lo que debía hacer).
-   Lo que cuelga de esa release es un zip subido a mano y con otro nombre,
-   mientras que el README manda descargar `piedrasonic-windows-x64.zip`, que no
-   existe en ninguna release: **quien entre a descargar hoy no encuentra lo que
-   el README le promete**. El workflow ya está arreglado, pero como no se ha
-   empujado ni etiquetado nada, no ha vuelto a ejecutarse nunca.
-3. **Los 28 segundos de la actualización**, con lo dicho en el punto 5.
+Pendiente: **la release v1.3.0 está coja.** Su compilación automática falló (el
+servidor de GitHub no tenía VLC y el `.spec` abortó, que es justo lo que debía
+hacer). Lo que cuelga de esa release es un zip subido a mano y con otro nombre,
+mientras que el README manda descargar `piedrasonic-windows-x64.zip`, que no
+existe en ninguna release: **quien entre a descargar hoy no encuentra lo que el
+README le promete**. El workflow ya está arreglado; hace falta fusionar y
+etiquetar para que se ejecute por primera vez.
 
 ## 8. Proyecto hermano
 

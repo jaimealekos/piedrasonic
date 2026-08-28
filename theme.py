@@ -38,6 +38,20 @@ def font(size=13, weight="normal"):
     return ctk.CTkFont(family=FONT_FAMILY, size=size, weight=weight)
 
 
+def mezcla(a, b, t):
+    """Color intermedio entre dos, en formato #rrggbb. t=0 da `a`, t=1 da `b`.
+
+    Tk no sabe de transparencias: para que algo se vea "a medio encender" hay
+    que darle el color ya mezclado con el fondo sobre el que se pinta.
+    """
+    t = 0.0 if t < 0 else (1.0 if t > 1 else t)
+    ra, ga, ba = (int(a[i:i + 2], 16) for i in (1, 3, 5))
+    rb, gb, bb = (int(b[i:i + 2], 16) for i in (1, 3, 5))
+    return "#%02x%02x%02x" % (round(ra + (rb - ra) * t),
+                              round(ga + (gb - ga) * t),
+                              round(ba + (bb - ba) * t))
+
+
 def init():
     ctk.set_appearance_mode("dark")
     ctk.deactivate_automatic_dpi_awareness  # no-op ref; DPI se gestiona por CTk
