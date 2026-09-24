@@ -1,0 +1,77 @@
+name: build
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # VLC que se empaqueta dentro del .exe. Fijado a proposito: una version
+  # concreta y verificada por hash es lo unico que hace la build reproducible.
+  VLC_VERSION: '3.0.23'
+  # El hash va AQUI y no se baja del servidor. Bajarlo del mismo sitio que el
+  # fichero no protege de gran cosa, y ademas fue lo que rompio la primera
+  # build: get.videolan.org reparte con una redireccion a un espejo, el
+  # .sha256 llego vacio y la comparacion fallo contra una cadena en blanco.
+  VLC_SHA256: '992d19dbd0b8a7cde9167d2f7780b1ef6f92acc8a71acfa736101a21f35181e1'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt pyinstaller==6.22.2
+
+      # El runner no trae VLC, y el que traen otros PCs suele ser de 32 bits.
+      # Se baja el zip oficial de 64 bits y se deja en vendor\vlc, que es lo
+      # primero que mira piedrasonic.spec.
+      - name: Descargar VLC de 64 bits
+        shell: pwsh
+        run: |
+          $zip = "vlc-$env:VLC_VERSION-win64.zip"
+          # curl y no Invoke-WebRequest: get.videolan.org contesta con una
+          # redireccion a un espejo, y hace falta seguirla Y reventar si lo que
+          # llega no es el fichero. Con -f un error HTTP es un error, no una
+          # pagina guardada en disco con nombre de zip.
+          curl.exe -fLsS --retry 5 --retry-all-errors --retry-delay 3 `
+                   -o $zip "https://get.videolan.org/vlc/$env:VLC_VERSION/win64/$zip"
+          $peso = (Get-Item $zip).Length
+          if ($peso -lt 30MB) { throw "$zip solo pesa $peso bytes: eso no es VLC" }
+          $real = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($real -ne $env:VLC_SHA256.ToLower()) {
+            throw "SHA256 de $zip no coincide.`n  esperado: $env:VLC_SHA256`n  recibido: $real"
+          }
+          Write-Host "VLC $env:VLC_VERSION verificado ($([math]::Round($peso/1MB)) MB)"
+          Expand-Archive $zip -DestinationPath vendor
+          Move-Item "vendor\vlc-$env:VLC_VERSION" vendor\vlc
+          if (-not (Test-Path vendor\vlc\libvlc.dll)) { throw "vendor\vlc incompleto" }
+
+      - name: Compilar
+        run: pyinstaller --noconfirm piedrasonic.spec
+
+      # Onedir: lo que se reparte es la carpeta entera comprimida. El .exe
+      # suelto no funciona sin _internal al lado.
+      - name: Comprimir
+        shell: pwsh
+        run: Compress-Archive -Path dist\piedrasonic\* -DestinationPath piedrasonic-windows-x64.zip
+
+      - name: Subir artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: piedrasonic-windows-x64
+          path: piedrasonic-windows-x64.zip
+
+      - name: Publicar Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: piedrasonic-windows-x64.zip

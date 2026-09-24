@@ -1,0 +1,35 @@
+# Datos del usuario y de ejecucion: el programa los escribe junto a si mismo
+# (ejecutando desde el codigo, aqui). Llevan la cuenta: nunca se suben.
+config.json
+cache.json
+cache.*.json
+conexiones.csv
+conexiones.csv.*
+piedrasonic-vlc.log
+
+# Descargas parciales / temporales
+*.part
+
+# Grabaciones: se guardan en la carpeta del programa, que ejecutando desde
+# el codigo es esta misma. Tambien pilla el video de pruebas y lo que graban
+# las pruebas, que se fabrican solos con ffmpeg cuando hacen falta.
+*.ts
+pruebas/grabado/
+
+# Basura que deja Windows por las carpetas con imagenes
+Thumbs.db
+desktop.ini
+
+# Python
+__pycache__/
+*.pyc
+
+# PyInstaller
+build/
+dist/
+# Zips de compilaciones hechas a mano, que se dejan en la raiz
+piedrasonic-*.zip
+
+# VLC de 64 bits del que tira el empaquetado (110 MB, no se versiona:
+# se baja el zip oficial de videolan.org y se descomprime aqui)
+vendor/
