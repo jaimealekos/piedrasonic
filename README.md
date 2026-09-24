@@ -26,9 +26,6 @@ suscripción que tengas.
 La primera vez Windows avisa de que el programa no está firmado: pulsa
 *Más información* → *Ejecutar de todas formas*.
 
-No saques `piedrasonic.exe` de su carpeta, que necesita lo que tiene al lado.
-Para tenerlo a mano, crea un acceso directo. Windows 10 u 11 de 64 bits.
-
 ## Uso
 
 Al abrirlo por primera vez te pide el **servidor**, el **usuario** y la
@@ -59,8 +56,6 @@ La cuenta, los favoritos y las grabaciones se guardan en la carpeta del
 programa. Si ahí no se puede escribir (por ejemplo, en *Archivos de programa*),
 van a `%LOCALAPPDATA%\piedrasonic`.
 
-¿Algo no va? Cuéntalo en [Issues](https://github.com/jaimealekos/piedrasonic/issues).
-
 ## Para programadores
 
 Hace falta Python 3.12 y un VLC de 64 bits: baja el zip de
@@ -81,8 +76,7 @@ pyinstaller piedrasonic.spec
 
 Sale la carpeta `dist\piedrasonic`, que es lo que va en el zip. Cómo está hecho
 por dentro: [docs/ARQUITECTURA.md](docs/ARQUITECTURA.md). Las pruebas:
-[pruebas/LEEME.md](pruebas/LEEME.md). Las capturas de este README salen de
-`python make_capturas.py`, con canales inventados.
+[pruebas/LEEME.md](pruebas/LEEME.md). 
 
 ## Licencia
 
