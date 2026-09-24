@@ -8,9 +8,7 @@
   <img alt="License" src="https://img.shields.io/badge/license-MIT-30d158">
 </p>
 
-Reproductor de IPTV para Windows. Pones los datos de tu proveedor y ves sus
-canales: lista a la izquierda, vídeo a la derecha, un clic y se ve. Lleva VLC
-dentro, así que no hay que instalar nada.
+Reproductor de IPTV para Windows. 
 
 Funciona con cualquier servicio compatible con **Xtream Codes**, que es el
 formato que usan casi todos. piedrasonic no trae canales: reproduce los de la
